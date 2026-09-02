@@ -3,7 +3,13 @@
 // reboots by living in chat metadata (saved to disk with the chat) instead of
 // relying on the model's context window or hand-authored World Info entries.
 //
-// See README.md for the design rationale and the static/dynamic field split.
+// Every field is dynamic (freely overwritten on each extraction pass) unless
+// you manually lock it. Locking a field doesn't stop it from ever being
+// filled — it just means a later proposal that DISAGREES with the current
+// value gets queued as a conflict for you to accept/reject, instead of being
+// applied silently or blocked silently.
+//
+// See README.md for the full design rationale.
 
 import { getContext, extension_settings } from '../../../extensions.js';
 import { eventSource, event_types, extension_prompt_roles } from '../../../../script.js';
@@ -11,8 +17,11 @@ import { eventSource, event_types, extension_prompt_roles } from '../../../../sc
 const MODULE_NAME = 'character_registry_tracker';
 const EXT_PROMPT_KEY = 'CRT_REGISTRY_BLOCK';
 
-const STATIC_FIELDS = ['name', 'sex', 'pronouns', 'species', 'height'];
-const DYNAMIC_FIELDS = ['relationship_to_user', 'weight', 'status', 'key_facts'];
+// Purely cosmetic grouping for the UI — behaves identically either way.
+const IDENTITY_FIELDS = ['name', 'sex', 'pronouns', 'species', 'height'];
+const STATE_FIELDS = ['relationship_to_user', 'weight', 'status', 'key_facts'];
+const ALL_FIELDS = [...IDENTITY_FIELDS, ...STATE_FIELDS];
+const ARRAY_FIELDS = ['key_facts'];
 
 const defaultSettings = {
     enabled: true,
@@ -21,6 +30,8 @@ const defaultSettings = {
     extractionWindow: 40,    // how many recent messages get sent to the extractor
     injectionDepth: 4,       // same idea as Author's Note depth
     injectionRole: extension_prompt_roles.SYSTEM,
+    floatingPanelOpen: false,
+    floatingPanelPos: null,  // { top, left } in px, persisted across sessions
 };
 
 // ---------------------------------------------------------------------------
@@ -45,9 +56,9 @@ function getSettings() {
 
 function emptyRegistry() {
     return {
-        entities: {},          // name -> { static: {}, dynamic: {}, locks: {}, included: true }
+        entities: {},          // name -> { fields: {}, locks: {}, included: true }
         lastExtractedIndex: 0, // index into context.chat up to which we've extracted
-        pendingConflicts: [],  // proposed static-field changes awaiting confirmation
+        pendingConflicts: [],  // proposed changes to locked fields awaiting confirmation
     };
 }
 
@@ -58,7 +69,6 @@ function getRegistry() {
     if (!existing) {
         return emptyRegistry();
     }
-    // Defensive defaults in case of an older/partial saved shape.
     return {
         entities: existing.entities ?? {},
         lastExtractedIndex: existing.lastExtractedIndex ?? 0,
@@ -77,13 +87,21 @@ function saveRegistry(registry) {
 function ensureEntity(registry, name) {
     if (!registry.entities[name]) {
         registry.entities[name] = {
-            static: {},
-            dynamic: {},
-            locks: { static: false, dynamic: {} },
+            fields: {},
+            locks: {},
             included: true,
         };
     }
     return registry.entities[name];
+}
+
+function valuesEqual(a, b) {
+    if (Array.isArray(a) || Array.isArray(b)) {
+        const arrA = Array.isArray(a) ? a : [a];
+        const arrB = Array.isArray(b) ? b : [b];
+        return arrA.length === arrB.length && arrA.every((v, i) => v === arrB[i]);
+    }
+    return a === b;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +115,7 @@ function buildExtractionPrompt(chatSlice, registry) {
 
     const currentRegistry = {};
     for (const [name, entity] of Object.entries(registry.entities)) {
-        currentRegistry[name] = { static: entity.static, dynamic: entity.dynamic };
+        currentRegistry[name] = entity.fields;
     }
 
     return [
@@ -108,20 +126,16 @@ function buildExtractionPrompt(chatSlice, registry) {
         '{',
         '  "updates": {',
         '    "<character name>": {',
-        '      "dynamic": { "relationship_to_user": "...", "weight": "...", "status": "...", "key_facts": ["..."] }',
+        `      "name": "...", "sex": "...", "pronouns": "...", "species": "...", "height": "...",`,
+        `      "relationship_to_user": "...", "weight": "...", "status": "...", "key_facts": ["..."]`,
         '    }',
-        '  },',
-        '  "static_conflicts": {',
-        '    "<character name>": { "<field>": { "old": "...", "new": "...", "reason": "..." } }',
         '  }',
         '}',
         '',
         'Rules:',
-        `- Only include a "static" block (fields: ${STATIC_FIELDS.join(', ')}) for a character if it has NO existing static data yet.`,
-        '- Never silently overwrite an existing static field. If the transcript contradicts one, put it under "static_conflicts" instead, and leave "updates" static-free for that character.',
-        `- "dynamic" fields (${DYNAMIC_FIELDS.join(', ')}) should reflect the latest state from the transcript. Omit fields that did not change or are not mentioned.`,
-        '- Only include characters who appear in this transcript slice.',
-        '- Omit the "static_conflicts" key entirely if there are none.',
+        '- For each character who appears in this transcript slice, include your best current understanding of every field you have information for — whether or not the registry already has a value for it. It is fine (and expected) to re-state a field that has not changed.',
+        '- Omit a field entirely if the transcript gives no information about it, rather than guessing.',
+        '- Only include characters who actually appear in this transcript slice.',
         '',
         '### Current registry',
         JSON.stringify(currentRegistry, null, 2),
@@ -132,7 +146,6 @@ function buildExtractionPrompt(chatSlice, registry) {
 }
 
 function parseExtractionResult(rawText) {
-    // Strip code fences if the model wrapped the JSON anyway.
     const cleaned = rawText.replace(/```json|```/g, '').trim();
     const match = cleaned.match(/\{[\s\S]*\}/);
     if (!match) {
@@ -143,43 +156,52 @@ function parseExtractionResult(rawText) {
 
 function mergeExtractionResult(registry, result) {
     const updates = result.updates || {};
+    let touched = 0;
+
     for (const [name, data] of Object.entries(updates)) {
         const entity = ensureEntity(registry, name);
+        let entityTouched = false;
 
-        // Static: only fill fields that are genuinely empty and unlocked.
-        if (data.static && !entity.locks.static) {
-            for (const field of STATIC_FIELDS) {
-                if (data.static[field] && !entity.static[field]) {
-                    entity.static[field] = data.static[field];
+        for (const field of ALL_FIELDS) {
+            if (data[field] === undefined || data[field] === null || data[field] === '') continue;
+
+            const proposed = ARRAY_FIELDS.includes(field) && !Array.isArray(data[field])
+                ? [data[field]]
+                : data[field];
+            const current = entity.fields[field];
+            const locked = !!entity.locks[field];
+
+            if (!locked) {
+                if (!valuesEqual(current, proposed)) {
+                    entity.fields[field] = proposed;
+                    entityTouched = true;
                 }
+                continue;
+            }
+
+            // Locked: fill freely if still empty (nothing to protect yet).
+            if (current === undefined) {
+                entity.fields[field] = proposed;
+                entityTouched = true;
+                continue;
+            }
+
+            // Locked and already set: only surface it if it actually disagrees.
+            if (!valuesEqual(current, proposed)) {
+                registry.pendingConflicts.push({
+                    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    entity: name,
+                    field,
+                    oldValue: current,
+                    newValue: proposed,
+                });
             }
         }
 
-        // Dynamic: overwrite unless the specific field is locked.
-        if (data.dynamic) {
-            for (const field of DYNAMIC_FIELDS) {
-                if (data.dynamic[field] === undefined) continue;
-                if (entity.locks.dynamic[field]) continue;
-                entity.dynamic[field] = data.dynamic[field];
-            }
-        }
+        if (entityTouched) touched++;
     }
 
-    const conflicts = result.static_conflicts || {};
-    for (const [name, fields] of Object.entries(conflicts)) {
-        for (const [field, change] of Object.entries(fields)) {
-            registry.pendingConflicts.push({
-                id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-                entity: name,
-                field,
-                oldValue: change.old,
-                newValue: change.new,
-                reason: change.reason || '',
-            });
-        }
-    }
-
-    return registry;
+    return { registry, touched };
 }
 
 async function runExtraction(manual = false) {
@@ -202,12 +224,12 @@ async function runExtraction(manual = false) {
     try {
         const rawResult = await context.generateQuietPrompt({ quietPrompt: prompt });
         const parsed = parseExtractionResult(rawResult);
-        mergeExtractionResult(registry, parsed);
+        const { touched } = mergeExtractionResult(registry, parsed);
         registry.lastExtractedIndex = chat.length;
         saveRegistry(registry);
         updateInjection();
         renderEntityList();
-        setStatus(`Registry updated (${Object.keys(parsed.updates || {}).length} character(s) touched).`);
+        setStatus(`Registry updated (${touched} character(s) touched).`);
     } catch (err) {
         console.error('[Character Registry Tracker] extraction failed:', err);
         setStatus('Extraction failed — see browser console for details.');
@@ -232,18 +254,17 @@ async function checkAutoExtract() {
 // ---------------------------------------------------------------------------
 
 function formatEntityLine(name, entity) {
+    const f = entity.fields;
     const parts = [];
-    const s = entity.static;
-    const d = entity.dynamic;
 
-    const staticBits = [s.pronouns, s.species, s.height].filter(Boolean);
-    if (staticBits.length) parts.push(staticBits.join(', '));
+    const identityBits = [f.pronouns, f.species, f.height].filter(Boolean);
+    if (identityBits.length) parts.push(identityBits.join(', '));
 
-    if (d.relationship_to_user) parts.push(`Relationship to {{user}}: ${d.relationship_to_user}`);
-    if (d.status) parts.push(`Status: ${d.status}`);
-    if (d.weight) parts.push(`Weight: ${d.weight}`);
-    if (Array.isArray(d.key_facts) && d.key_facts.length) {
-        parts.push(`Facts: ${d.key_facts.join('; ')}`);
+    if (f.relationship_to_user) parts.push(`Relationship to {{user}}: ${f.relationship_to_user}`);
+    if (f.status) parts.push(`Status: ${f.status}`);
+    if (f.weight) parts.push(`Weight: ${f.weight}`);
+    if (Array.isArray(f.key_facts) && f.key_facts.length) {
+        parts.push(`Facts: ${f.key_facts.join('; ')}`);
     }
 
     return `${name}: ${parts.join('. ')}`;
@@ -275,25 +296,27 @@ function updateInjection() {
 }
 
 // ---------------------------------------------------------------------------
-// UI
+// UI — shared markup builders (rendered into both the settings-drawer panel
+// and the floating window; they stay in sync because both re-render on
+// every registry change)
 // ---------------------------------------------------------------------------
 
 function setStatus(text) {
-    $('#crt_status').text(text);
+    $('.crt_status_target').text(text);
 }
 
-function fieldRowHtml(entityName, group, field, value, locked) {
-    const inputId = `crt_${group}_${entityName}_${field}`;
+function fieldRowHtml(entityName, field, value, locked) {
+    const inputId = `crt_field_${entityName}_${field}`;
     const displayValue = Array.isArray(value) ? value.join('; ') : (value ?? '');
     return `
         <div class="crt_field_row">
             <label for="${inputId}">${field}</label>
             <input type="text" id="${inputId}" class="text_pole crt_field_input"
-                data-entity="${entityName}" data-group="${group}" data-field="${field}"
+                data-entity="${entityName}" data-field="${field}"
                 value="${$('<div>').text(displayValue).html()}" />
-            <label class="checkbox_label crt_lock_label">
+            <label class="checkbox_label crt_lock_label" title="Lock: protects this field from silent overwrite. A later proposed change is queued as a conflict instead of applied.">
                 <input type="checkbox" class="crt_lock_toggle"
-                    data-entity="${entityName}" data-group="${group}" data-field="${field}"
+                    data-entity="${entityName}" data-field="${field}"
                     ${locked ? 'checked' : ''} />
                 lock
             </label>
@@ -301,22 +324,23 @@ function fieldRowHtml(entityName, group, field, value, locked) {
 }
 
 function conflictRowHtml(conflict) {
+    const oldDisplay = Array.isArray(conflict.oldValue) ? conflict.oldValue.join('; ') : conflict.oldValue;
+    const newDisplay = Array.isArray(conflict.newValue) ? conflict.newValue.join('; ') : conflict.newValue;
     return `
         <div class="crt_conflict_row" data-id="${conflict.id}">
-            <strong>${conflict.entity}.${conflict.field}</strong>:
-            "${conflict.oldValue}" → "${conflict.newValue}"
-            ${conflict.reason ? `<div class="crt_conflict_reason">${conflict.reason}</div>` : ''}
-            <button class="menu_button crt_conflict_accept" data-id="${conflict.id}">Accept</button>
-            <button class="menu_button crt_conflict_reject" data-id="${conflict.id}">Reject</button>
+            <strong>${conflict.entity}.${conflict.field}</strong> is locked at
+            "${oldDisplay}" — extraction proposed "${newDisplay}".
+            <button class="menu_button crt_conflict_accept" data-id="${conflict.id}">Accept new value</button>
+            <button class="menu_button crt_conflict_reject" data-id="${conflict.id}">Keep locked value</button>
         </div>`;
 }
 
 function entityBlockHtml(name, entity) {
-    const staticRows = STATIC_FIELDS
-        .map(f => fieldRowHtml(name, 'static', f, entity.static[f], entity.locks.static))
+    const identityRows = IDENTITY_FIELDS
+        .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
-    const dynamicRows = DYNAMIC_FIELDS
-        .map(f => fieldRowHtml(name, 'dynamic', f, entity.dynamic[f], !!entity.locks.dynamic[f]))
+    const stateRows = STATE_FIELDS
+        .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
 
     return `
@@ -330,78 +354,67 @@ function entityBlockHtml(name, entity) {
                 </label>
                 <button class="menu_button crt_delete_entity" data-entity="${name}">Delete</button>
             </div>
-            <div class="crt_field_group"><em>Static</em>${staticRows}</div>
-            <div class="crt_field_group"><em>Dynamic</em>${dynamicRows}</div>
+            <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
+            <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
         </div>`;
+}
+
+function buildEntityListHtml(registry) {
+    const names = Object.keys(registry.entities).sort();
+    if (names.length === 0) {
+        return '<div class="crt_empty">No characters tracked yet. Send some messages or hit Rescan.</div>';
+    }
+    return names.map(name => entityBlockHtml(name, registry.entities[name])).join('');
+}
+
+function buildConflictListHtml(registry) {
+    if (registry.pendingConflicts.length === 0) {
+        return '<div class="crt_empty">No pending conflicts on locked fields.</div>';
+    }
+    return registry.pendingConflicts.map(conflictRowHtml).join('');
 }
 
 function renderEntityList() {
     const registry = getRegistry();
-    const $list = $('#crt_entity_list');
-    if ($list.length === 0) return;
-
-    $list.empty();
-
-    const names = Object.keys(registry.entities).sort();
-    if (names.length === 0) {
-        $list.append('<div class="crt_empty">No characters tracked yet. Send some messages or hit Rescan.</div>');
-    } else {
-        for (const name of names) {
-            $list.append(entityBlockHtml(name, registry.entities[name]));
-        }
-    }
-
-    const $conflicts = $('#crt_conflict_list');
-    $conflicts.empty();
-    if (registry.pendingConflicts.length === 0) {
-        $conflicts.append('<div class="crt_empty">No pending static-field conflicts.</div>');
-    } else {
-        for (const conflict of registry.pendingConflicts) {
-            $conflicts.append(conflictRowHtml(conflict));
-        }
-    }
+    // Re-render every mounted instance (settings-drawer panel + floating window)
+    // so both stay in sync regardless of which one triggered the change.
+    $('.crt_entity_list_target').html(buildEntityListHtml(registry));
+    $('.crt_conflict_list_target').html(buildConflictListHtml(registry));
 }
 
-function bindEntityListEvents() {
-    const $list = $('#crt_panel');
+// ---------------------------------------------------------------------------
+// UI — event handling (delegated from document so it covers both mounted
+// panel instances without double-binding)
+// ---------------------------------------------------------------------------
 
-    $list.on('change', '.crt_field_input', function () {
+function bindEntityListEvents() {
+    const $doc = $(document);
+
+    $doc.on('change', '.crt_field_input', function () {
         const $el = $(this);
         const registry = getRegistry();
         const entity = ensureEntity(registry, $el.data('entity'));
-        const group = $el.data('group');
         const field = $el.data('field');
         const value = $el.val();
 
-        if (group === 'static') {
-            entity.static[field] = value;
-        } else if (field === 'key_facts') {
-            entity.dynamic[field] = value.split(';').map(s => s.trim()).filter(Boolean);
-        } else {
-            entity.dynamic[field] = value;
-        }
+        entity.fields[field] = ARRAY_FIELDS.includes(field)
+            ? value.split(';').map(s => s.trim()).filter(Boolean)
+            : value;
 
         saveRegistry(registry);
         updateInjection();
     });
 
-    $list.on('change', '.crt_lock_toggle', function () {
+    $doc.on('change', '.crt_lock_toggle', function () {
         const $el = $(this);
         const registry = getRegistry();
         const entity = ensureEntity(registry, $el.data('entity'));
-        const group = $el.data('group');
         const field = $el.data('field');
-        const locked = $el.is(':checked');
-
-        if (group === 'static') {
-            entity.locks.static = locked;
-        } else {
-            entity.locks.dynamic[field] = locked;
-        }
+        entity.locks[field] = $el.is(':checked');
         saveRegistry(registry);
     });
 
-    $list.on('change', '.crt_include_toggle', function () {
+    $doc.on('change', '.crt_include_toggle', function () {
         const $el = $(this);
         const registry = getRegistry();
         const entity = ensureEntity(registry, $el.data('entity'));
@@ -410,7 +423,7 @@ function bindEntityListEvents() {
         updateInjection();
     });
 
-    $list.on('click', '.crt_delete_entity', function () {
+    $doc.on('click', '.crt_delete_entity', function () {
         const name = $(this).data('entity');
         const registry = getRegistry();
         delete registry.entities[name];
@@ -419,33 +432,42 @@ function bindEntityListEvents() {
         renderEntityList();
     });
 
-    $list.on('click', '.crt_conflict_accept', function () {
+    $doc.on('click', '.crt_conflict_accept', function () {
         resolveConflict($(this).data('id'), true);
     });
-    $list.on('click', '.crt_conflict_reject', function () {
+    $doc.on('click', '.crt_conflict_reject', function () {
         resolveConflict($(this).data('id'), false);
     });
 
-    $list.on('click', '#crt_rescan_btn', function () {
+    $doc.on('click', '.crt_rescan_btn', function () {
         runExtraction(true);
     });
 
-    $list.on('change', '#crt_enabled', function () {
+    // Settings-drawer-only controls (unique ids, so no delegation collision risk)
+    $doc.on('change', '#crt_enabled', function () {
         getSettings().enabled = $(this).is(':checked');
         updateInjection();
     });
-    $list.on('change', '#crt_auto_extract', function () {
+    $doc.on('change', '#crt_auto_extract', function () {
         getSettings().autoExtract = $(this).is(':checked');
     });
-    $list.on('change', '#crt_extract_every_n', function () {
+    $doc.on('change', '#crt_extract_every_n', function () {
         getSettings().extractEveryN = Number($(this).val()) || defaultSettings.extractEveryN;
     });
-    $list.on('change', '#crt_extraction_window', function () {
+    $doc.on('change', '#crt_extraction_window', function () {
         getSettings().extractionWindow = Number($(this).val()) || defaultSettings.extractionWindow;
     });
-    $list.on('change', '#crt_injection_depth', function () {
+    $doc.on('change', '#crt_injection_depth', function () {
         getSettings().injectionDepth = Number($(this).val()) || defaultSettings.injectionDepth;
         updateInjection();
+    });
+
+    // Floating window controls
+    $doc.on('click', '#crt_toggle_button', function () {
+        toggleFloatingPanel();
+    });
+    $doc.on('click', '#crt_floating_close', function () {
+        setFloatingPanelOpen(false);
     });
 }
 
@@ -457,12 +479,16 @@ function resolveConflict(id, accept) {
     const conflict = registry.pendingConflicts[idx];
     if (accept) {
         const entity = ensureEntity(registry, conflict.entity);
-        entity.static[conflict.field] = conflict.newValue;
+        entity.fields[conflict.field] = conflict.newValue;
     }
     registry.pendingConflicts.splice(idx, 1);
     saveRegistry(registry);
     renderEntityList();
 }
+
+// ---------------------------------------------------------------------------
+// UI — settings-drawer panel
+// ---------------------------------------------------------------------------
 
 function settingsPanelHtml() {
     const settings = getSettings();
@@ -494,17 +520,93 @@ function settingsPanelHtml() {
                     <label for="crt_injection_depth">Injection depth (Author's-Note-style)</label>
                     <input type="number" id="crt_injection_depth" class="text_pole" min="0" value="${settings.injectionDepth}" />
                 </div>
-                <button id="crt_rescan_btn" class="menu_button">Rescan now</button>
-                <div id="crt_status" class="crt_status"></div>
+                <button class="menu_button crt_rescan_btn">Rescan now</button>
+                <div class="crt_status crt_status_target"></div>
 
                 <h4>Tracked characters</h4>
-                <div id="crt_entity_list"></div>
+                <div class="crt_entity_list_target"></div>
 
-                <h4>Pending static-field conflicts</h4>
-                <div id="crt_conflict_list"></div>
+                <h4>Pending conflicts on locked fields</h4>
+                <div class="crt_conflict_list_target"></div>
             </div>
         </div>
     </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// UI — floating draggable window (quick access for mid-chat edits)
+// ---------------------------------------------------------------------------
+
+function floatingPanelHtml() {
+    return `
+    <div id="crt_floating_panel">
+        <div id="crt_floating_header">
+            <span>Character Registry</span>
+            <div id="crt_floating_close" class="fa-solid fa-xmark interactable" title="Close"></div>
+        </div>
+        <div id="crt_floating_body">
+            <button class="menu_button crt_rescan_btn">Rescan now</button>
+            <div class="crt_status crt_status_target"></div>
+            <div class="crt_entity_list_target"></div>
+            <h4>Pending conflicts on locked fields</h4>
+            <div class="crt_conflict_list_target"></div>
+        </div>
+    </div>`;
+}
+
+function toggleFloatingPanel() {
+    const settings = getSettings();
+    setFloatingPanelOpen(!settings.floatingPanelOpen);
+}
+
+function setFloatingPanelOpen(open) {
+    const settings = getSettings();
+    settings.floatingPanelOpen = open;
+    $('#crt_floating_panel').toggle(open);
+    if (open) {
+        renderEntityList();
+    }
+}
+
+function makeFloatingPanelDraggable() {
+    const $panel = $('#crt_floating_panel');
+    const $header = $('#crt_floating_header');
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+
+    $header.on('mousedown', function (e) {
+        dragging = true;
+        const offset = $panel.offset();
+        offsetX = e.pageX - offset.left;
+        offsetY = e.pageY - offset.top;
+        e.preventDefault();
+    });
+
+    $(document).on('mousemove', function (e) {
+        if (!dragging) return;
+        const top = e.pageY - offsetY;
+        const left = e.pageX - offsetX;
+        $panel.css({ top: `${top}px`, left: `${left}px` });
+    });
+
+    $(document).on('mouseup', function () {
+        if (!dragging) return;
+        dragging = false;
+        const settings = getSettings();
+        settings.floatingPanelPos = { top: parseInt($panel.css('top')), left: parseInt($panel.css('left')) };
+    });
+}
+
+function injectToolbarButton() {
+    if ($('#crt_toggle_button').length) return;
+    const $target = $('#rightSendForm');
+    if ($target.length === 0) {
+        setTimeout(injectToolbarButton, 500);
+        return;
+    }
+    const $btn = $('<div id="crt_toggle_button" class="fa-solid fa-address-card interactable" title="Character Registry"></div>');
+    $target.prepend($btn);
 }
 
 // ---------------------------------------------------------------------------
@@ -512,7 +614,21 @@ function settingsPanelHtml() {
 // ---------------------------------------------------------------------------
 
 export async function init() {
+    const settings = getSettings();
+
     $('#extensions_settings2').append(settingsPanelHtml());
+    $('body').append(floatingPanelHtml());
+
+    if (settings.floatingPanelPos) {
+        $('#crt_floating_panel').css({
+            top: `${settings.floatingPanelPos.top}px`,
+            left: `${settings.floatingPanelPos.left}px`,
+        });
+    }
+    $('#crt_floating_panel').toggle(!!settings.floatingPanelOpen);
+
+    injectToolbarButton();
+    makeFloatingPanelDraggable();
     bindEntityListEvents();
     renderEntityList();
     updateInjection();

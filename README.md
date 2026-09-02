@@ -25,18 +25,46 @@ if you're running from a zip). Enable it from the Extensions panel. A
 "Character Registry Tracker" drawer will appear in the extensions settings
 sidebar.
 
+## Editing characters mid-chat
+
+A small address-card icon appears in the chat toolbar (next to the send
+button area) — click it to open a floating, draggable, resizable window with
+the same entity editor as the settings drawer. Both stay in sync; edit from
+whichever is more convenient. The window's open/closed state and position
+are remembered across sessions.
+
+## Where the registry is stored
+
+Not a separate file — it lives inside the chat's own file, so it survives
+reboots without extra bookkeeping. SillyTavern writes `chat_metadata` (the
+registry sits under the key `character_registry_tracker`) as the **first
+line** of the chat's `.jsonl` file:
+
+```
+SillyTavern/data/<your-user-handle>/chats/<CharacterName>/<chat-file-name>.jsonl
+```
+
+(or `data/<handle>/group chats/<group-id>.jsonl` for group chats). You can
+inspect it directly in a text editor.
+
 ## How it works
 
-- **Static fields** (name, sex, pronouns, species, height): filled once,
-  locked by default. The extractor will never overwrite one on its own — if
-  the chat contradicts it, the change goes into "Pending static-field
-  conflicts" for you to accept or reject by hand.
-- **Dynamic fields** (relationship_to_user, weight, status, key_facts):
-  refreshed on every extraction pass, unless you lock an individual field.
+- **Every field is dynamic by default.** name, sex, pronouns, species, height,
+  relationship_to_user, weight, status, key_facts — all of them get freely
+  overwritten on each extraction pass, no exceptions, until you decide
+  otherwise.
+- **Locking is manual and per-field.** Check "lock" on any field to protect
+  it. A locked-but-empty field still gets filled normally the first time
+  there's data for it — locking doesn't block population, only *drift* once
+  a value exists. If a later extraction pass proposes something different
+  for a locked field, that goes into "Pending conflicts on locked fields"
+  for you to accept or reject, instead of being applied or silently dropped.
 - **Extraction**: every N messages (default 30, configurable), a *quiet*
   background generation is sent to the same KoboldCPP connection as your
-  main chat — it doesn't appear in the chat log — asking it to return a
-  small JSON diff of what changed. You can also hit "Rescan now" any time.
+  main chat — it doesn't appear in the chat log — asking it to return its
+  best current understanding of every field it has information for, for
+  every character in the recent slice. You can also hit "Rescan now" any
+  time.
 - **Injection**: whichever entities have "include in context" checked get
   formatted into a compact `[Character Registry]` block and injected at a
   fixed depth (default 4, matching typical Author's Note placement), so it's
@@ -64,6 +92,13 @@ accurate as of now. Two things I couldn't verify without a live instance:
 2. **Manifest quirks.** If this hits the same ES-module loader issue v1 hit,
    send me the console error and I'll port it to the IIFE + jQuery-event
    pattern the way v1 was fixed.
+
+**Note on the field-schema change**: the registry's per-entity shape changed
+(no more separate static/dynamic buckets, locks are now a flat per-field
+map). If you'd already been testing against the previous version, any saved
+registry data in a chat's metadata is in the old shape and won't be read by
+this version — you'll start fresh for chats you'd already run extraction on.
+Not an issue for chats you haven't scanned yet.
 
 ## Files
 

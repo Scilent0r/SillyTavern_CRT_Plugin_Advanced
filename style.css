@@ -93,3 +93,116 @@
     margin-top: 0.3em;
     margin-right: 0.4em;
 }
+
+/* Floating window */
+#crt_toggle_button {
+    cursor: pointer;
+    opacity: 0.8;
+}
+#crt_toggle_button:hover {
+    opacity: 1;
+}
+
+#crt_floating_panel {
+    display: none;
+    position: fixed;
+    top: 15%;
+    left: 30%;
+    width: 420px;
+    max-width: 90vw;
+    max-height: 70vh;
+    background: var(--SmartThemeBlurTintColor, #1e1e1e);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 8px;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+    z-index: 9999;
+    resize: both;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+#crt_floating_header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.5em 0.8em;
+    cursor: move;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+    font-weight: bold;
+    user-select: none;
+}
+
+#crt_floating_close {
+    cursor: pointer;
+    opacity: 0.7;
+}
+#crt_floating_close:hover {
+    opacity: 1;
+}
+
+#crt_floating_body {
+    padding: 0.6em 0.8em;
+    overflow-y: auto;
+    flex: 1;
+}
+
+/* Re-use the same entity block / field row styling outside #crt_panel too */
+#crt_floating_panel .crt_entity_block {
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 6px;
+    padding: 0.5em 0.7em;
+    margin-bottom: 0.6em;
+}
+#crt_floating_panel .crt_entity_header {
+    display: flex;
+    align-items: center;
+    gap: 0.8em;
+    margin-bottom: 0.4em;
+}
+#crt_floating_panel .crt_entity_header strong {
+    flex: 1;
+}
+#crt_floating_panel .crt_field_group em {
+    display: block;
+    opacity: 0.7;
+    font-size: 0.85em;
+    margin: 0.4em 0 0.2em 0;
+}
+#crt_floating_panel .crt_field_row {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    margin: 0.15em 0;
+}
+#crt_floating_panel .crt_field_row label:first-child {
+    width: 8em;
+    flex-shrink: 0;
+    opacity: 0.8;
+    font-size: 0.85em;
+}
+#crt_floating_panel .crt_field_row input.crt_field_input {
+    flex: 1;
+}
+#crt_floating_panel .crt_lock_label {
+    font-size: 0.8em;
+    white-space: nowrap;
+}
+#crt_floating_panel .crt_status {
+    font-size: 0.85em;
+    opacity: 0.75;
+    margin: 0.4em 0 0.8em 0;
+    min-height: 1.2em;
+}
+#crt_floating_panel .crt_empty {
+    opacity: 0.6;
+    font-style: italic;
+    padding: 0.4em 0;
+}
+#crt_floating_panel .crt_conflict_row {
+    border: 1px solid var(--warning, #b58900);
+    border-radius: 6px;
+    padding: 0.4em 0.6em;
+    margin-bottom: 0.5em;
+    font-size: 0.9em;
+}
