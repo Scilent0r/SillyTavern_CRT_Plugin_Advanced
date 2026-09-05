@@ -1,4 +1,4 @@
-# Character Registry Tracker (CCT v2)
+# Character Registry Tracker (CRT)
 
 Solves the "SillyTavern forgets Halfrun is a she after a reboot" problem.
 Chat logs survive reboots fine — what's lost is anything that only lived in
