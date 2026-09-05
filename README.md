@@ -164,6 +164,17 @@ wrong shape, it gets sent back to the model once with "this wasn't valid
 JSON, fix it" before an error code is shown. This reduces failures somewhat
 without any setup, but doesn't eliminate them the way grammar mode does.
 
+**Response length is independent of your main chat's setting, on both
+paths.** A full JSON registry dump for several characters needs more tokens
+than a typical roleplay reply, so if extraction inherited your normal
+"Response (tokens)" setting, a short main-chat length (e.g. 600) would
+truncate the JSON mid-object — the classic cause of `NO_JSON`/`BAD_JSON`
+failures that only go away when you happen to raise your *main* response
+length as a side effect. Both paths have their own dedicated setting instead:
+"Max response length (tokens)" for grammar mode, "Extraction response
+length (tokens, non-grammar path)" for the fallback — raise whichever one
+applies to you rather than touching your main chat's length.
+
 ## Known risk areas / please report back
 
 I built this against SillyTavern's `release` branch source (fetched

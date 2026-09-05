@@ -35,6 +35,7 @@ const defaultSettings = {
     koboldBaseUrl: '',       // e.g. http://127.0.0.1:5001 — leave blank to skip grammar mode
     koboldMaxContext: 8192,
     koboldMaxLength: 512,
+    fallbackResponseLength: 1024, // independent of ST's main "Response (tokens)" setting
 };
 
 // A GBNF grammar that structurally forces the output to be exactly
@@ -397,7 +398,12 @@ async function getRawExtraction(prompt, settings) {
         return await callGrammarConstrained(prompt, settings);
     }
     const context = getContext();
-    return await context.generateQuietPrompt({ quietPrompt: prompt });
+    // Independent of ST's main "Response (tokens)" setting — generateQuietPrompt
+    // temporarily swaps it for this call only, then restores it. Without this,
+    // extraction silently inherits whatever your main chat response length is
+    // set to, which is usually far too short for a full JSON registry dump and
+    // causes truncated/unparseable output (NO_JSON, BAD_JSON).
+    return await context.generateQuietPrompt({ quietPrompt: prompt, responseLength: settings.fallbackResponseLength });
 }
 
 function buildRepairPrompt(brokenText) {
@@ -429,8 +435,13 @@ async function runExtraction(manual = false) {
         if (manual) setStatus('An extraction is already in progress — wait for it to finish.', 'info');
         return;
     }
-    if (mainGenerationActive) {
-        if (manual) reportError('GENERATION_IN_PROGRESS');
+    // Only the manual button can race an in-progress generation (someone
+    // clicking Rescan while a reply is actively streaming). The auto path is
+    // triggered by MESSAGE_RECEIVED, which only fires once a message's text
+    // is fully finalized — the backend call for it is already done by then,
+    // streaming or not, so there's nothing to guard against there.
+    if (manual && mainGenerationActive) {
+        reportError('GENERATION_IN_PROGRESS');
         return;
     }
 
@@ -803,6 +814,9 @@ function bindEntityListEvents() {
         getSettings().injectionDepth = Number($(this).val()) || defaultSettings.injectionDepth;
         updateInjection();
     });
+    $doc.on('change', '#crt_fallback_response_length', function () {
+        getSettings().fallbackResponseLength = Number($(this).val()) || defaultSettings.fallbackResponseLength;
+    });
     $doc.on('change', '#crt_kobold_url', function () {
         getSettings().koboldBaseUrl = $(this).val().trim();
     });
@@ -887,6 +901,11 @@ function settingsPanelHtml() {
                     <label for="crt_injection_depth">Injection depth (Author's-Note-style)</label>
                     <input type="number" id="crt_injection_depth" class="text_pole" min="0" value="${settings.injectionDepth}" />
                 </div>
+                <div class="crt_setting_row">
+                    <label for="crt_fallback_response_length">Extraction response length (tokens, non-grammar path)</label>
+                    <input type="number" id="crt_fallback_response_length" class="text_pole" min="128" value="${settings.fallbackResponseLength}" />
+                </div>
+                <p class="crt_hint">Independent of your main "Response (tokens)" setting — a full JSON registry dump usually needs more room than a normal chat reply. If extraction fails with NO_JSON/BAD_JSON, raise this rather than your main response length.</p>
 
                 <h4>Grammar-constrained extraction (optional, recommended)</h4>
                 <p class="crt_hint">Fill this in to force syntactically-valid JSON via KoboldCPP's grammar support (v1.44+) — eliminates most extraction parse failures. Leave blank to use the normal connection with an automatic repair retry instead.</p>
