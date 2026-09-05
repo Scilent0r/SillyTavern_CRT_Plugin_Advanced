@@ -5,8 +5,8 @@
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "Scile",
-    "version": "0.1.1",
+    "author": "D",
+    "version": "0.1.0",
     "homePage": "https://github.com/",
     "hooks": {
         "activate": "init"

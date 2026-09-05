@@ -28,11 +28,51 @@ const defaultSettings = {
     autoExtract: true,
     extractEveryN: 30,       // messages since last extraction before auto-firing
     extractionWindow: 40,    // how many recent messages get sent to the extractor
-    injectionDepth: 4,       // same idea as Author's Note depth
+    injectionDepth: 1,       // depth 0-2 stays closest to the strongest-attention zone (see README)
     injectionRole: extension_prompt_roles.SYSTEM,
     floatingPanelOpen: false,
     floatingPanelPos: null,  // { top, left } in px, persisted across sessions
+    koboldBaseUrl: '',       // e.g. http://127.0.0.1:5001 — leave blank to skip grammar mode
+    koboldMaxContext: 8192,
+    koboldMaxLength: 512,
 };
+
+// A GBNF grammar that structurally forces the output to be exactly
+// {"updates": {"<name>": {<any valid JSON object>}, ...}}. The outer shape
+// is locked; per-character field objects stay generically JSON-valid (any
+// keys/values) so we don't have to hand-encode every field name into the
+// grammar and risk it going stale as fields change.
+const JSON_SHAPE_GRAMMAR = `
+root    ::= "{" ws "\\"updates\\"" ws ":" ws updates ws "}" ws
+updates ::= "{" ws (pair ("," ws pair)*)? "}" ws
+pair    ::= string ":" ws fields
+fields  ::= "{" ws (fpair ("," ws fpair)*)? "}" ws
+fpair   ::= string ":" ws value
+
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+
+string ::=
+  "\\"" (
+    [^"\\\\\\x7F\\x00-\\x1F] |
+    "\\\\" (["\\\\bfnrt] | "u" [0-9a-fA-F]{4})
+  )* "\\"" ws
+
+number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+
+ws ::= | " " | "\\n" [ \\t]{0,20}
+`.trim();
 
 // ---------------------------------------------------------------------------
 // Settings (global, per-install)
@@ -97,11 +137,20 @@ function ensureEntity(registry, name) {
 
 function valuesEqual(a, b) {
     if (Array.isArray(a) || Array.isArray(b)) {
-        const arrA = Array.isArray(a) ? a : [a];
-        const arrB = Array.isArray(b) ? b : [b];
+        const arrA = (Array.isArray(a) ? a : [a]).map(String).sort();
+        const arrB = (Array.isArray(b) ? b : [b]).map(String).sort();
         return arrA.length === arrB.length && arrA.every((v, i) => v === arrB[i]);
     }
     return a === b;
+}
+
+function escapeHtml(str) {
+    return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +159,7 @@ function valuesEqual(a, b) {
 
 function buildExtractionPrompt(chatSlice, registry) {
     const transcript = chatSlice
+        .filter(m => !m.is_system)
         .map(m => `${m.name || (m.is_user ? 'User' : 'Assistant')}: ${m.mes}`)
         .join('\n');
 
@@ -145,20 +195,63 @@ function buildExtractionPrompt(chatSlice, registry) {
     ].join('\n');
 }
 
+// Finds the first balanced {...} object in text, correctly skipping braces
+// that appear inside string literals. Returns null if none found or the
+// object is truncated/unbalanced (e.g. response got cut off at max_length) —
+// callers treat that as NO_JSON rather than trying to parse garbage.
+function extractFirstJsonObject(text) {
+    const start = text.indexOf('{');
+    if (start === -1) return null;
+
+    let depth = 0;
+    let inString = false;
+    let escapeNext = false;
+
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (escapeNext) {
+            escapeNext = false;
+            continue;
+        }
+        if (ch === '\\') {
+            escapeNext = true;
+            continue;
+        }
+        if (ch === '"') {
+            inString = !inString;
+            continue;
+        }
+        if (inString) continue;
+        if (ch === '{') {
+            depth++;
+        } else if (ch === '}') {
+            depth--;
+            if (depth === 0) return text.slice(start, i + 1);
+        }
+    }
+    return null; // unbalanced
+}
+
 function parseExtractionResult(rawText) {
     const cleaned = rawText.replace(/```json|```/g, '').trim();
-    const match = cleaned.match(/\{[\s\S]*\}/);
-    if (!match) {
-        throw new Error('No JSON object found in extraction response');
+    const candidate = extractFirstJsonObject(cleaned);
+    if (!candidate) {
+        const err = new Error('No balanced JSON object found in extraction response');
+        err.code = 'NO_JSON';
+        throw err;
     }
-    return JSON.parse(match[0]);
+    // Let JSON.parse's SyntaxError propagate as-is — the caller distinguishes
+    // "no JSON at all" (err.code === 'NO_JSON') from "JSON-shaped but broken".
+    return JSON.parse(candidate);
 }
 
 function mergeExtractionResult(registry, result) {
     const updates = result.updates || {};
     let touched = 0;
 
-    for (const [name, data] of Object.entries(updates)) {
+    for (const [rawName, data] of Object.entries(updates)) {
+        const name = String(rawName).trim();
+        if (!name) continue;
         const entity = ensureEntity(registry, name);
         let entityTouched = false;
 
@@ -204,36 +297,245 @@ function mergeExtractionResult(registry, result) {
     return { registry, touched };
 }
 
+// Error codes, in the order a run can hit them. Each has a fixed, specific
+// user-facing message plus a concrete next step — never just "failed".
+const ERROR_CODES = {
+    NO_CHAT: {
+        message: 'No chat messages yet',
+        hint: 'Send or receive at least one message first, then Rescan.',
+    },
+    GENERATION_IN_PROGRESS: {
+        message: 'The main chat is still generating a reply',
+        hint: 'Wait for the current response to finish before Rescanning — KoboldCPP can only serve one generation at a time.',
+    },
+    GENERATION_FAILED: {
+        message: 'The backend call for the quiet extraction prompt failed',
+        hint: 'Check that KoboldCPP is running and connected in the API panel — this is the same connection your normal replies use.',
+    },
+    EMPTY_RESPONSE: {
+        message: 'The model returned an empty response',
+        hint: 'Try Rescan again. If it keeps happening, check the quiet-generation max response length in your connection settings.',
+    },
+    NO_JSON: {
+        message: 'The model did not return any JSON at all',
+        hint: 'It ignored the extraction instructions — try a more capable/instruction-following model, or lower "Messages sent per extraction pass" so the prompt is shorter.',
+    },
+    BAD_JSON: {
+        message: 'The model returned JSON-like text that failed to parse',
+        hint: 'Common with small/quantized local models under load. Try Rescan again; if it persists, try a different model for extraction.',
+    },
+    BAD_SHAPE: {
+        message: 'Parsed JSON but it was missing the expected "updates" object',
+        hint: 'The model didn\u2019t follow the requested format. Try Rescan again.',
+    },
+    MERGE_FAILED: {
+        message: 'Internal error while applying the extracted data to the registry',
+        hint: 'This looks like a bug in the extension rather than the model\u2019s output — check the browser console for the stack trace.',
+    },
+    SAVE_FAILED: {
+        message: 'Failed to save the registry into chat metadata',
+        hint: 'Check the browser console — could be a storage/permissions issue with the chat file, or the chat changed mid-save.',
+    },
+    GRAMMAR_UNREACHABLE: {
+        message: 'Could not reach the KoboldCPP URL configured for grammar-constrained extraction',
+        hint: 'Check the "KoboldCPP API URL" setting is correct and the server is running. If your browser console shows a CORS error, KoboldCPP needs to be reachable from this page\u2019s origin.',
+    },
+    GRAMMAR_HTTP_ERROR: {
+        message: 'KoboldCPP returned an error response for the grammar-constrained call',
+        hint: 'Check the KoboldCPP console/log for details — the URL responded but rejected the request.',
+    },
+    GRAMMAR_TIMEOUT: {
+        message: 'The grammar-constrained call timed out with no response',
+        hint: 'KoboldCPP may be busy serving the main chat generation, or stuck. Check its console, and avoid Rescanning while a reply is still generating.',
+    },
+};
+
+const GRAMMAR_CALL_TIMEOUT_MS = 120000;
+
+async function callGrammarConstrained(prompt, settings) {
+    const baseUrl = settings.koboldBaseUrl.replace(/\/+$/, '');
+    const url = `${baseUrl}/api/v1/generate`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), GRAMMAR_CALL_TIMEOUT_MS);
+
+    let response;
+    try {
+        response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                prompt,
+                grammar: JSON_SHAPE_GRAMMAR,
+                max_length: settings.koboldMaxLength,
+                max_context_length: settings.koboldMaxContext,
+                temperature: 0.2,
+                rep_pen: 1.0,
+            }),
+            signal: controller.signal,
+        });
+    } catch (err) {
+        const wrapped = new Error(err.message);
+        wrapped.code = err.name === 'AbortError' ? 'GRAMMAR_TIMEOUT' : 'GRAMMAR_UNREACHABLE';
+        throw wrapped;
+    } finally {
+        clearTimeout(timeoutId);
+    }
+
+    if (!response.ok) {
+        const err = new Error(`HTTP ${response.status}`);
+        err.code = 'GRAMMAR_HTTP_ERROR';
+        throw err;
+    }
+
+    const data = await response.json();
+    return data?.results?.[0]?.text ?? '';
+}
+
+async function getRawExtraction(prompt, settings) {
+    if (settings.koboldBaseUrl) {
+        return await callGrammarConstrained(prompt, settings);
+    }
+    const context = getContext();
+    return await context.generateQuietPrompt({ quietPrompt: prompt });
+}
+
+function buildRepairPrompt(brokenText) {
+    return [
+        'The following text was supposed to be a single JSON object matching this exact shape:',
+        '{ "updates": { "<character name>": { "<field>": "<value>", ... }, ... } }',
+        'It is not valid JSON, or is missing the "updates" key. Return ONLY the corrected JSON object — no prose, no code fences.',
+        '',
+        '### Broken output',
+        brokenText,
+    ].join('\n');
+}
+
+function reportError(code, err, rawResult) {
+    const def = ERROR_CODES[code] || { message: 'Unknown error', hint: 'Check the browser console.' };
+    console.error(`[Character Registry Tracker] [${code}] ${def.message}`, err || '', rawResult !== undefined ? { rawResult } : '');
+    setStatus(`✗ [${code}] ${def.message}. ${def.hint}`, 'error');
+}
+
+let isExtracting = false;
+let mainGenerationActive = false;
+
+function setExtractionInProgress(active) {
+    $('.crt_rescan_btn').prop('disabled', active);
+}
+
 async function runExtraction(manual = false) {
+    if (isExtracting) {
+        if (manual) setStatus('An extraction is already in progress — wait for it to finish.', 'info');
+        return;
+    }
+    if (mainGenerationActive) {
+        if (manual) reportError('GENERATION_IN_PROGRESS');
+        return;
+    }
+
+    isExtracting = true;
+    setExtractionInProgress(true);
+    try {
+        await runExtractionInner(manual);
+    } finally {
+        isExtracting = false;
+        setExtractionInProgress(false);
+    }
+}
+
+async function runExtractionInner(manual) {
     const settings = getSettings();
     const context = getContext();
     const chat = context.chat || [];
     const registry = getRegistry();
 
     if (!manual && !settings.autoExtract) return;
-    if (chat.length === 0) return;
+    if (chat.length === 0) {
+        if (manual) reportError('NO_CHAT');
+        return;
+    }
 
     const startIndex = Math.max(0, chat.length - settings.extractionWindow);
     const chatSlice = chat.slice(startIndex);
-
-    if (chatSlice.length === 0) return;
+    if (chatSlice.length === 0) {
+        if (manual) reportError('NO_CHAT');
+        return;
+    }
 
     const prompt = buildExtractionPrompt(chatSlice, registry);
-    setStatus('Extracting character facts…');
+    setStatus(settings.koboldBaseUrl ? 'Extracting (grammar-constrained)…' : 'Extracting character facts…', 'info');
+
+    let rawResult;
+    try {
+        rawResult = await getRawExtraction(prompt, settings);
+    } catch (err) {
+        const code = ['GRAMMAR_UNREACHABLE', 'GRAMMAR_HTTP_ERROR', 'GRAMMAR_TIMEOUT'].includes(err.code)
+            ? err.code
+            : 'GENERATION_FAILED';
+        reportError(code, err);
+        return;
+    }
+
+    if (!rawResult || !String(rawResult).trim()) {
+        reportError('EMPTY_RESPONSE');
+        return;
+    }
+
+    let parsed = tryParseAndValidate(rawResult);
+
+    // One automatic repair pass before surfacing an error to the user.
+    // Grammar mode should essentially never need this; the non-grammar
+    // fallback path is where this earns its keep.
+    if (!parsed.ok) {
+        setStatus('First response wasn\u2019t usable — retrying with a repair pass…', 'info');
+        try {
+            const repaired = await getRawExtraction(buildRepairPrompt(rawResult), settings);
+            parsed = tryParseAndValidate(repaired);
+            if (!parsed.ok) parsed.rawResult = repaired;
+        } catch (err) {
+            // Repair call itself failed — report the ORIGINAL parse error,
+            // since that's the more informative root cause.
+        }
+    }
+
+    if (!parsed.ok) {
+        reportError(parsed.code, parsed.err, parsed.rawResult ?? rawResult);
+        return;
+    }
+
+    let touched;
+    try {
+        ({ touched } = mergeExtractionResult(registry, parsed.value));
+    } catch (err) {
+        reportError('MERGE_FAILED', err);
+        return;
+    }
 
     try {
-        const rawResult = await context.generateQuietPrompt({ quietPrompt: prompt });
-        const parsed = parseExtractionResult(rawResult);
-        const { touched } = mergeExtractionResult(registry, parsed);
         registry.lastExtractedIndex = chat.length;
         saveRegistry(registry);
-        updateInjection();
-        renderEntityList();
-        setStatus(`Registry updated (${touched} character(s) touched).`);
     } catch (err) {
-        console.error('[Character Registry Tracker] extraction failed:', err);
-        setStatus('Extraction failed — see browser console for details.');
+        reportError('SAVE_FAILED', err);
+        return;
     }
+
+    updateInjection();
+    renderEntityList();
+    setStatus(`✓ Registry updated (${touched} character(s) touched).`, 'ok');
+}
+
+function tryParseAndValidate(rawResult) {
+    let parsed;
+    try {
+        parsed = parseExtractionResult(rawResult);
+    } catch (err) {
+        return { ok: false, code: err.code === 'NO_JSON' ? 'NO_JSON' : 'BAD_JSON', err };
+    }
+    if (typeof parsed !== 'object' || parsed === null || typeof parsed.updates !== 'object' || parsed.updates === null) {
+        return { ok: false, code: 'BAD_SHAPE' };
+    }
+    return { ok: true, value: parsed };
 }
 
 async function checkAutoExtract() {
@@ -244,7 +546,11 @@ async function checkAutoExtract() {
     const chat = context.chat || [];
     const registry = getRegistry();
 
-    if (chat.length - registry.lastExtractedIndex >= settings.extractEveryN) {
+    // Clamp against a shrunk chat (deleted messages) so a stale watermark
+    // higher than the current length can't permanently stall auto-extract.
+    const lastIndex = Math.min(registry.lastExtractedIndex, chat.length);
+
+    if (chat.length - lastIndex >= settings.extractEveryN) {
         await runExtraction(false);
     }
 }
@@ -270,9 +576,16 @@ function formatEntityLine(name, entity) {
     return `${name}: ${parts.join('. ')}`;
 }
 
+function hasAnyField(entity) {
+    return ALL_FIELDS.some(f => {
+        const v = entity.fields[f];
+        return Array.isArray(v) ? v.length > 0 : !!v;
+    });
+}
+
 function buildInjectionText(registry) {
     const lines = Object.entries(registry.entities)
-        .filter(([, entity]) => entity.included)
+        .filter(([, entity]) => entity.included && hasAnyField(entity))
         .map(([name, entity]) => formatEntityLine(name, entity));
 
     if (lines.length === 0) return '';
@@ -301,22 +614,26 @@ function updateInjection() {
 // every registry change)
 // ---------------------------------------------------------------------------
 
-function setStatus(text) {
-    $('.crt_status_target').text(text);
+function setStatus(text, level = 'info') {
+    const $targets = $('.crt_status_target');
+    $targets.text(text);
+    $targets.removeClass('crt_status_ok crt_status_error crt_status_info');
+    $targets.addClass(`crt_status_${level}`);
 }
 
 function fieldRowHtml(entityName, field, value, locked) {
-    const inputId = `crt_field_${entityName}_${field}`;
+    const safeEntity = escapeHtml(entityName);
+    const inputId = `crt_field_${safeEntity}_${field}`;
     const displayValue = Array.isArray(value) ? value.join('; ') : (value ?? '');
     return `
         <div class="crt_field_row">
-            <label for="${inputId}">${field}</label>
+            <label for="${inputId}">${escapeHtml(field)}</label>
             <input type="text" id="${inputId}" class="text_pole crt_field_input"
-                data-entity="${entityName}" data-field="${field}"
-                value="${$('<div>').text(displayValue).html()}" />
+                data-entity="${safeEntity}" data-field="${escapeHtml(field)}"
+                value="${escapeHtml(displayValue)}" />
             <label class="checkbox_label crt_lock_label" title="Lock: protects this field from silent overwrite. A later proposed change is queued as a conflict instead of applied.">
                 <input type="checkbox" class="crt_lock_toggle"
-                    data-entity="${entityName}" data-field="${field}"
+                    data-entity="${safeEntity}" data-field="${escapeHtml(field)}"
                     ${locked ? 'checked' : ''} />
                 lock
             </label>
@@ -327,15 +644,16 @@ function conflictRowHtml(conflict) {
     const oldDisplay = Array.isArray(conflict.oldValue) ? conflict.oldValue.join('; ') : conflict.oldValue;
     const newDisplay = Array.isArray(conflict.newValue) ? conflict.newValue.join('; ') : conflict.newValue;
     return `
-        <div class="crt_conflict_row" data-id="${conflict.id}">
-            <strong>${conflict.entity}.${conflict.field}</strong> is locked at
-            "${oldDisplay}" — extraction proposed "${newDisplay}".
-            <button class="menu_button crt_conflict_accept" data-id="${conflict.id}">Accept new value</button>
-            <button class="menu_button crt_conflict_reject" data-id="${conflict.id}">Keep locked value</button>
+        <div class="crt_conflict_row" data-id="${escapeHtml(conflict.id)}">
+            <strong>${escapeHtml(conflict.entity)}.${escapeHtml(conflict.field)}</strong> is locked at
+            "${escapeHtml(oldDisplay)}" — extraction proposed "${escapeHtml(newDisplay)}".
+            <button class="menu_button crt_conflict_accept" data-id="${escapeHtml(conflict.id)}">Accept new value</button>
+            <button class="menu_button crt_conflict_reject" data-id="${escapeHtml(conflict.id)}">Keep locked value</button>
         </div>`;
 }
 
 function entityBlockHtml(name, entity) {
+    const safeName = escapeHtml(name);
     const identityRows = IDENTITY_FIELDS
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
@@ -344,15 +662,15 @@ function entityBlockHtml(name, entity) {
         .join('');
 
     return `
-        <div class="crt_entity_block" data-entity="${name}">
+        <div class="crt_entity_block" data-entity="${safeName}">
             <div class="crt_entity_header">
-                <strong>${name}</strong>
+                <strong>${safeName}</strong>
                 <label class="checkbox_label">
-                    <input type="checkbox" class="crt_include_toggle" data-entity="${name}"
+                    <input type="checkbox" class="crt_include_toggle" data-entity="${safeName}"
                         ${entity.included ? 'checked' : ''} />
                     include in context
                 </label>
-                <button class="menu_button crt_delete_entity" data-entity="${name}">Delete</button>
+                <button class="menu_button crt_delete_entity" data-entity="${safeName}">Delete</button>
             </div>
             <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
             <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
@@ -376,10 +694,18 @@ function buildConflictListHtml(registry) {
 
 function renderEntityList() {
     const registry = getRegistry();
-    // Re-render every mounted instance (settings-drawer panel + floating window)
-    // so both stay in sync regardless of which one triggered the change.
-    $('.crt_entity_list_target').html(buildEntityListHtml(registry));
+    const active = document.activeElement;
+    const isEditingField = active && (
+        active.classList.contains('crt_field_input') || active.classList.contains('crt_add_entity_input')
+    );
+
+    // Don't nuke an input the user is actively typing in — a background
+    // auto-extraction pass finishing mid-edit shouldn't wipe their keystrokes.
+    // The conflict list is unrelated DOM, so it's always safe to refresh.
     $('.crt_conflict_list_target').html(buildConflictListHtml(registry));
+    if (isEditingField) return;
+
+    $('.crt_entity_list_target').html(buildEntityListHtml(registry));
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +729,9 @@ function bindEntityListEvents() {
 
         saveRegistry(registry);
         updateInjection();
+        // Safe to catch up the full list now — this fires on blur, so focus
+        // has already moved and renderEntityList() won't clobber anything.
+        renderEntityList();
     });
 
     $doc.on('change', '.crt_lock_toggle', function () {
@@ -443,6 +772,19 @@ function bindEntityListEvents() {
         runExtraction(true);
     });
 
+    $doc.on('click', '.crt_add_entity_btn', function () {
+        const $input = $(this).siblings('.crt_add_entity_input');
+        addEntityManually($input.val());
+        $input.val('');
+    });
+    $doc.on('keydown', '.crt_add_entity_input', function (e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            addEntityManually($(this).val());
+            $(this).val('');
+        }
+    });
+
     // Settings-drawer-only controls (unique ids, so no delegation collision risk)
     $doc.on('change', '#crt_enabled', function () {
         getSettings().enabled = $(this).is(':checked');
@@ -461,6 +803,15 @@ function bindEntityListEvents() {
         getSettings().injectionDepth = Number($(this).val()) || defaultSettings.injectionDepth;
         updateInjection();
     });
+    $doc.on('change', '#crt_kobold_url', function () {
+        getSettings().koboldBaseUrl = $(this).val().trim();
+    });
+    $doc.on('change', '#crt_kobold_max_context', function () {
+        getSettings().koboldMaxContext = Number($(this).val()) || defaultSettings.koboldMaxContext;
+    });
+    $doc.on('change', '#crt_kobold_max_length', function () {
+        getSettings().koboldMaxLength = Number($(this).val()) || defaultSettings.koboldMaxLength;
+    });
 
     // Floating window controls
     $doc.on('click', '#crt_toggle_button', function () {
@@ -469,6 +820,22 @@ function bindEntityListEvents() {
     $doc.on('click', '#crt_floating_close', function () {
         setFloatingPanelOpen(false);
     });
+}
+
+function addEntityManually(rawName) {
+    const name = String(rawName || '').trim();
+    if (!name) return;
+
+    const registry = getRegistry();
+    if (registry.entities[name]) {
+        setStatus(`"${name}" is already in the registry — edit their fields below instead.`, 'error');
+        return;
+    }
+
+    ensureEntity(registry, name);
+    saveRegistry(registry);
+    renderEntityList();
+    setStatus(`Added "${name}" manually. Fill in fields below, or wait for the next extraction pass to fill in what it can.`, 'ok');
 }
 
 function resolveConflict(id, accept) {
@@ -520,10 +887,30 @@ function settingsPanelHtml() {
                     <label for="crt_injection_depth">Injection depth (Author's-Note-style)</label>
                     <input type="number" id="crt_injection_depth" class="text_pole" min="0" value="${settings.injectionDepth}" />
                 </div>
+
+                <h4>Grammar-constrained extraction (optional, recommended)</h4>
+                <p class="crt_hint">Fill this in to force syntactically-valid JSON via KoboldCPP's grammar support (v1.44+) — eliminates most extraction parse failures. Leave blank to use the normal connection with an automatic repair retry instead.</p>
+                <div class="crt_setting_row">
+                    <label for="crt_kobold_url">KoboldCPP API URL</label>
+                    <input type="text" id="crt_kobold_url" class="text_pole" placeholder="http://127.0.0.1:5001" value="${settings.koboldBaseUrl}" />
+                </div>
+                <div class="crt_setting_row">
+                    <label for="crt_kobold_max_context">Max context (tokens)</label>
+                    <input type="number" id="crt_kobold_max_context" class="text_pole" min="512" value="${settings.koboldMaxContext}" />
+                </div>
+                <div class="crt_setting_row">
+                    <label for="crt_kobold_max_length">Max response length (tokens)</label>
+                    <input type="number" id="crt_kobold_max_length" class="text_pole" min="64" value="${settings.koboldMaxLength}" />
+                </div>
+
                 <button class="menu_button crt_rescan_btn">Rescan now</button>
                 <div class="crt_status crt_status_target"></div>
 
                 <h4>Tracked characters</h4>
+                <div class="crt_add_entity_row">
+                    <input type="text" class="text_pole crt_add_entity_input" placeholder="Character name (if a scan missed them)" />
+                    <button class="menu_button crt_add_entity_btn">Add character</button>
+                </div>
                 <div class="crt_entity_list_target"></div>
 
                 <h4>Pending conflicts on locked fields</h4>
@@ -547,6 +934,10 @@ function floatingPanelHtml() {
         <div id="crt_floating_body">
             <button class="menu_button crt_rescan_btn">Rescan now</button>
             <div class="crt_status crt_status_target"></div>
+            <div class="crt_add_entity_row">
+                <input type="text" class="text_pole crt_add_entity_input" placeholder="Character name (if a scan missed them)" />
+                <button class="menu_button crt_add_entity_btn">Add character</button>
+            </div>
             <div class="crt_entity_list_target"></div>
             <h4>Pending conflicts on locked fields</h4>
             <div class="crt_conflict_list_target"></div>
@@ -598,11 +989,15 @@ function makeFloatingPanelDraggable() {
     });
 }
 
-function injectToolbarButton() {
+function injectToolbarButton(attemptsLeft = 20) {
     if ($('#crt_toggle_button').length) return;
     const $target = $('#rightSendForm');
     if ($target.length === 0) {
-        setTimeout(injectToolbarButton, 500);
+        if (attemptsLeft <= 0) {
+            console.warn('[Character Registry Tracker] Could not find #rightSendForm after several attempts — toolbar button not attached. The settings-drawer panel still works.');
+            return;
+        }
+        setTimeout(() => injectToolbarButton(attemptsLeft - 1), 500);
         return;
     }
     const $btn = $('<div id="crt_toggle_button" class="fa-solid fa-address-card interactable" title="Character Registry"></div>');
@@ -634,6 +1029,7 @@ export async function init() {
     updateInjection();
 
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        setStatus('', 'info');
         renderEntityList();
         updateInjection();
     });
@@ -641,5 +1037,15 @@ export async function init() {
     eventSource.on(event_types.MESSAGE_RECEIVED, () => {
         renderEntityList();
         checkAutoExtract();
+    });
+
+    eventSource.on(event_types.GENERATION_STARTED, () => {
+        mainGenerationActive = true;
+    });
+    eventSource.on(event_types.GENERATION_ENDED, () => {
+        mainGenerationActive = false;
+    });
+    eventSource.on(event_types.GENERATION_STOPPED, () => {
+        mainGenerationActive = false;
     });
 }

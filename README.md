@@ -74,6 +74,96 @@ inspect it directly in a text editor.
   not global), alongside the chat history itself — no separate database, no
   extra files to lose track of.
 
+## Injection positioning: depth and format
+
+Two separate design questions, answered from research + SillyTavern's own
+mechanics rather than guesswork:
+
+**Depth.** LLMs show a well-documented "lost in the middle" U-shaped
+attention curve over long context (Liu et al., [arxiv:2307.03172](https://arxiv.org/abs/2307.03172)) — performance is
+strongest when relevant info sits at the very start or very end of context,
+and drops significantly in the middle. This is mechanically driven by
+RoPE's distance-decay: for causal generation, tokens near the end of context
+get systematically more attention regardless of content. SillyTavern's own
+Author's Note docs confirm the same thing directly: depth 0 = very end of
+chat history (strongest influence on the next response), depth 4 = pushed
+behind the most recent 3 messages (weaker influence). Author's Note's
+*default* of 4 is tuned for general scene-direction notes that don't need
+to dominate the next token — this registry is closer to the "always-on
+character fact" case the SillyTavern community already places at low depth
+for exactly this reason. Default here is **depth 1**, not 4. It's still a
+live setting — the true optimum is somewhat model-dependent (different
+RoPE bases/finetunes decay differently), so if a particular local model
+seems to under- or over-weight the block, adjust it and watch adherence
+over a few turns.
+
+**Format.** The injected block was never raw JSON — JSON only exists in the
+internal extraction call. What actually lands in the conversation is the
+bracketed prose block (`[Character Registry] Halfrun: she/her, human...
+[/Character Registry]`), deliberately. Raw JSON sitting inside an ongoing
+roleplay context is out-of-distribution for most models mid-narrative —
+JSON in training data is overwhelmingly paired with code/API contexts, not
+story continuation, so a model is more likely to under-attend to it or
+start echoing JSON-like syntax into its own prose. The bracket-tag format
+matches how the SillyTavern community already writes this kind of always-on
+injected fact (e.g. `[Genre; Tags; Scenario]`), which reads as "world fact"
+rather than "text to imitate."
+
+## Manual add & error codes
+
+- **Add character** button (settings drawer and floating window, above the
+  entity list) lets you create an entity by name directly — useful when a
+  scan misses someone. It's created empty; fill in fields yourself or wait
+  for the next extraction pass.
+- Every extraction failure reports a specific code, not just "failed":
+
+  | Code | Meaning |
+  |---|---|
+  | `NO_CHAT` | No messages in the chat yet to scan |
+  | `GENERATION_FAILED` | The quiet background call to your normal connection failed (connection down, model not loaded) |
+  | `EMPTY_RESPONSE` | Backend responded but with nothing in it |
+  | `NO_JSON` | Model ignored the format instructions entirely |
+  | `BAD_JSON` | Model returned JSON-shaped text that doesn't actually parse |
+  | `BAD_SHAPE` | Parsed fine but missing the expected `updates` key |
+  | `MERGE_FAILED` | Internal bug applying the data — not a model problem |
+  | `SAVE_FAILED` | Couldn't write the registry into chat metadata |
+  | `GRAMMAR_UNREACHABLE` | Couldn't reach the configured KoboldCPP URL for grammar mode |
+  | `GRAMMAR_HTTP_ERROR` | KoboldCPP reached, but rejected the grammar-mode request |
+
+  Each shows in the status line (red, with the code and a concrete next
+  step) and logs the same info plus the raw model output to the browser
+  console for `NO_JSON`/`BAD_JSON`/`BAD_SHAPE`.
+
+## Reducing extraction failures: grammar-constrained mode
+
+`NO_JSON`, `BAD_JSON`, and `BAD_SHAPE` are all "the model didn't follow the
+requested format" failures — the more you rely on the model's own
+discipline, the more they happen, especially with smaller local models under
+load. There's a real fix for this rather than just tightening the prompt:
+**KoboldCPP grammar support** (v1.44+) can constrain generation so it is
+*structurally impossible* for the output to be anything other than valid
+JSON matching a shape you define — not "usually," but never.
+
+To enable it, fill in **KoboldCPP API URL** in the settings drawer (e.g.
+`http://127.0.0.1:5001` — same address you use for your main connection).
+When set, extraction bypasses SillyTavern's own generation pipeline and
+calls KoboldCPP's native `/api/v1/generate` endpoint directly with a GBNF
+grammar that locks the output to exactly `{"updates": {"<name>": {...fields
+as valid JSON...}}}`. This is a separate call from your normal chat
+generation, so it never affects your roleplay replies — only extraction.
+
+Two extra settings appear alongside it: **max context** and **max response
+length** (tokens) for that direct call — defaults (8192 / 512) are generous
+enough for most setups, raise "max context" if your extraction window
+setting is large and the prompt is getting truncated.
+
+**If you leave the URL blank**, extraction still works via the original
+path (through your normal ST connection, no direct call) — but now with one
+automatic repair retry: if the first response fails to parse or has the
+wrong shape, it gets sent back to the model once with "this wasn't valid
+JSON, fix it" before an error code is shown. This reduces failures somewhat
+without any setup, but doesn't eliminate them the way grammar mode does.
+
 ## Known risk areas / please report back
 
 I built this against SillyTavern's `release` branch source (fetched
@@ -82,13 +172,12 @@ directly, not from memory) for the extension API surface — `getContext()`,
 `generateQuietPrompt`, and the event bus — so the plumbing should be
 accurate as of now. Two things I couldn't verify without a live instance:
 
-1. **Extraction JSON reliability.** Some backends/models are sloppy about
-   returning clean JSON even when asked. The parser strips code fences and
-   grabs the first `{...}` block, but a badly-formatted response will just
-   fail extraction silently (check the browser console — it logs the error).
-   If this happens a lot with your model, tell me and I'll add a stricter
-   grammar constraint via KoboldCPP's JSON schema support instead of relying
-   on prompt instructions alone.
+1. **Grammar-mode endpoint assumptions.** I used KoboldCPP's native
+   `/api/v1/generate` endpoint (not the OpenAI-compatible one) since that's
+   where ST's own code confirms grammar support lives. If your KoboldCPP is
+   only exposed via a reverse proxy that blocks that path, or CORS isn't
+   permissive for this page's origin, you'll see `GRAMMAR_UNREACHABLE` —
+   tell me the exact error and I'll adjust.
 2. **Manifest quirks.** If this hits the same ES-module loader issue v1 hit,
    send me the console error and I'll port it to the IIFE + jQuery-event
    pattern the way v1 was fixed.
