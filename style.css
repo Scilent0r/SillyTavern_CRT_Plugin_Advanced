@@ -49,6 +49,12 @@
     margin: 0.1em 0 0.5em 0;
 }
 
+#crt_floating_panel .crt_hint {
+    font-size: 0.8em;
+    opacity: 0.65;
+    padding: 0.2em 0;
+}
+
 #crt_panel .crt_empty {
     opacity: 0.6;
     font-style: italic;

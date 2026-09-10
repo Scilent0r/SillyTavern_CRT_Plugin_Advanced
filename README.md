@@ -1,4 +1,4 @@
-# Character Registry Tracker (CRT)
+# Character Registry Tracker (CCT v2)
 
 Solves the "SillyTavern forgets Halfrun is a she after a reboot" problem.
 Chat logs survive reboots fine — what's lost is anything that only lived in
@@ -108,6 +108,26 @@ start echoing JSON-like syntax into its own prose. The bracket-tag format
 matches how the SillyTavern community already writes this kind of always-on
 injected fact (e.g. `[Genre; Tags; Scenario]`), which reads as "world fact"
 rather than "text to imitate."
+
+## Fields tracked
+
+**Identity** (name, sex, age, pronouns, species, height, physique) — shown
+for every character. "sex" is a fixed two-option dropdown (male/female,
+plus unset) rather than free text, since body-detail visibility keys off it
+exactly.
+
+**Body detail** (bust, waist, hip) — three separate lockable fields, not one
+blob string, so you can lock waist without locking bust. Visibility is fully
+automatic and tied to "sex": the section only appears once sex is set to
+female, and disappears again if it's changed away from female. There's no
+manual override — the extraction prompt is instructed to only propose these
+three fields for characters whose sex is female and never invent numbers,
+and the merge logic enforces the same rule server-side even if a model
+ignores the prompt, so stored data can't drift out of sync with what's ever
+shown or injected.
+
+**Story state** (relationship_to_user, weight, status, key_facts) — the
+parts of a character expected to actually change over the story.
 
 ## Manual add & error codes
 

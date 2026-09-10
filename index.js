@@ -17,11 +17,14 @@ import { eventSource, event_types, extension_prompt_roles } from '../../../../sc
 const MODULE_NAME = 'character_registry_tracker';
 const EXT_PROMPT_KEY = 'CRT_REGISTRY_BLOCK';
 
-// Purely cosmetic grouping for the UI — behaves identically either way.
-const IDENTITY_FIELDS = ['name', 'sex', 'pronouns', 'species', 'height'];
+// Purely cosmetic grouping for the UI — behaves identically either way,
+// except BODY_DETAIL_FIELDS are conditionally hidden (see shouldShowBodyDetail).
+const IDENTITY_FIELDS = ['name', 'sex', 'age', 'pronouns', 'species', 'height', 'physique'];
+const BODY_DETAIL_FIELDS = ['bust', 'waist', 'hip'];
 const STATE_FIELDS = ['relationship_to_user', 'weight', 'status', 'key_facts'];
-const ALL_FIELDS = [...IDENTITY_FIELDS, ...STATE_FIELDS];
+const ALL_FIELDS = [...IDENTITY_FIELDS, ...BODY_DETAIL_FIELDS, ...STATE_FIELDS];
 const ARRAY_FIELDS = ['key_facts'];
+const SEX_OPTIONS = ['', 'male', 'female']; // '' = unset
 
 const defaultSettings = {
     enabled: true,
@@ -136,6 +139,12 @@ function ensureEntity(registry, name) {
     return registry.entities[name];
 }
 
+// Body detail visibility is purely automatic: tied to the "sex" field, which
+// is a fixed male/female choice (see SEX_OPTIONS + fieldRowHtml).
+function shouldShowBodyDetail(entity) {
+    return entity.fields.sex === 'female';
+}
+
 function valuesEqual(a, b) {
     if (Array.isArray(a) || Array.isArray(b)) {
         const arrA = (Array.isArray(a) ? a : [a]).map(String).sort();
@@ -177,7 +186,8 @@ function buildExtractionPrompt(chatSlice, registry) {
         '{',
         '  "updates": {',
         '    "<character name>": {',
-        `      "name": "...", "sex": "...", "pronouns": "...", "species": "...", "height": "...",`,
+        `      "name": "...", "sex": "...", "age": "...", "pronouns": "...", "species": "...", "height": "...", "physique": "...",`,
+        `      "bust": "...", "waist": "...", "hip": "...",`,
         `      "relationship_to_user": "...", "weight": "...", "status": "...", "key_facts": ["..."]`,
         '    }',
         '  }',
@@ -186,6 +196,9 @@ function buildExtractionPrompt(chatSlice, registry) {
         'Rules:',
         '- For each character who appears in this transcript slice, include your best current understanding of every field you have information for — whether or not the registry already has a value for it. It is fine (and expected) to re-state a field that has not changed.',
         '- Omit a field entirely if the transcript gives no information about it, rather than guessing.',
+        '- "physique" (general build, e.g. "athletic", "stocky", "slender") applies to any character.',
+        '- "sex" must be exactly "male" or "female" if it can be determined from the transcript. Omit it if unclear.',
+        '- "bust", "waist", "hip" are specific body measurements. Only include them for characters whose "sex" is female AND only when the transcript actually gives that information. Never invent numbers — omit all three rather than guess.',
         '- Only include characters who actually appear in this transcript slice.',
         '',
         '### Current registry',
@@ -259,9 +272,23 @@ function mergeExtractionResult(registry, result) {
         for (const field of ALL_FIELDS) {
             if (data[field] === undefined || data[field] === null || data[field] === '') continue;
 
-            const proposed = ARRAY_FIELDS.includes(field) && !Array.isArray(data[field])
+            let proposed = ARRAY_FIELDS.includes(field) && !Array.isArray(data[field])
                 ? [data[field]]
                 : data[field];
+
+            // "sex" is a fixed male/female choice (drives body-detail visibility) —
+            // normalize casing and reject anything that isn't exactly one of the two.
+            if (field === 'sex') {
+                const normalized = String(proposed).trim().toLowerCase();
+                if (normalized !== 'male' && normalized !== 'female') continue;
+                proposed = normalized;
+            }
+
+            // Belt-and-suspenders: even if the model ignores the prompt's
+            // instruction, never store body-detail fields for a non-female
+            // entity — keeps stored data consistent with what's ever visible.
+            if (BODY_DETAIL_FIELDS.includes(field) && entity.fields.sex !== 'female') continue;
+
             const current = entity.fields[field];
             const locked = !!entity.locks[field];
 
@@ -304,10 +331,6 @@ const ERROR_CODES = {
     NO_CHAT: {
         message: 'No chat messages yet',
         hint: 'Send or receive at least one message first, then Rescan.',
-    },
-    GENERATION_IN_PROGRESS: {
-        message: 'The main chat is still generating a reply',
-        hint: 'Wait for the current response to finish before Rescanning — KoboldCPP can only serve one generation at a time.',
     },
     GENERATION_FAILED: {
         message: 'The backend call for the quiet extraction prompt failed',
@@ -435,14 +458,16 @@ async function runExtraction(manual = false) {
         if (manual) setStatus('An extraction is already in progress — wait for it to finish.', 'info');
         return;
     }
-    // Only the manual button can race an in-progress generation (someone
-    // clicking Rescan while a reply is actively streaming). The auto path is
-    // triggered by MESSAGE_RECEIVED, which only fires once a message's text
-    // is fully finalized — the backend call for it is already done by then,
-    // streaming or not, so there's nothing to guard against there.
+    // Deliberately not blocking on "main generation in progress" here anymore.
+    // That guard depended on ST's GENERATION_STARTED/ENDED pairing exactly
+    // matching our assumptions, and broke in more than one way in practice
+    // (non-streaming setups, our own quiet calls tripping it on themselves).
+    // KoboldCPP queues a concurrent request rather than corrupting anything,
+    // so the actual cost of getting this wrong was just "extraction waits a
+    // bit longer" — not worth the recurring false-block bugs. If the main
+    // chat happens to be generating, just let the user know and proceed.
     if (manual && mainGenerationActive) {
-        reportError('GENERATION_IN_PROGRESS');
-        return;
+        setStatus('Main chat looks like it\u2019s still generating — extraction may take a bit longer than usual.', 'info');
     }
 
     isExtracting = true;
@@ -574,8 +599,28 @@ function formatEntityLine(name, entity) {
     const f = entity.fields;
     const parts = [];
 
-    const identityBits = [f.pronouns, f.species, f.height].filter(Boolean);
+    const identityBits = [
+        f.age ? `${f.age} y/o` : null,
+        f.pronouns,
+        f.species,
+        f.height,
+    ].filter(Boolean);
     if (identityBits.length) parts.push(identityBits.join(', '));
+
+    if (f.physique) parts.push(`Build: ${f.physique}`);
+
+    const sizes = [f.bust, f.waist, f.hip];
+    if (shouldShowBodyDetail(entity) && sizes.some(Boolean)) {
+        if (sizes.every(Boolean)) {
+            parts.push(`Measurements (B/W/H): ${f.bust}/${f.waist}/${f.hip}`);
+        } else {
+            const labeled = [];
+            if (f.bust) labeled.push(`bust ${f.bust}`);
+            if (f.waist) labeled.push(`waist ${f.waist}`);
+            if (f.hip) labeled.push(`hip ${f.hip}`);
+            parts.push(`Measurements: ${labeled.join(', ')}`);
+        }
+    }
 
     if (f.relationship_to_user) parts.push(`Relationship to {{user}}: ${f.relationship_to_user}`);
     if (f.status) parts.push(`Status: ${f.status}`);
@@ -635,19 +680,35 @@ function setStatus(text, level = 'info') {
 function fieldRowHtml(entityName, field, value, locked) {
     const safeEntity = escapeHtml(entityName);
     const inputId = `crt_field_${safeEntity}_${field}`;
+    const lockCheckbox = `
+            <label class="checkbox_label crt_lock_label" title="Lock: protects this field from silent overwrite. A later proposed change is queued as a conflict instead of applied.">
+                <input type="checkbox" class="crt_lock_toggle"
+                    data-entity="${safeEntity}" data-field="${escapeHtml(field)}"
+                    ${locked ? 'checked' : ''} />
+                lock
+            </label>`;
+
+    if (field === 'sex') {
+        const optionsHtml = SEX_OPTIONS.map(opt => {
+            const label = opt === '' ? '(unset)' : opt.charAt(0).toUpperCase() + opt.slice(1);
+            const selected = (value || '') === opt ? ' selected' : '';
+            return `<option value="${opt}"${selected}>${label}</option>`;
+        }).join('');
+        return `
+        <div class="crt_field_row">
+            <label for="${inputId}">${escapeHtml(field)}</label>
+            <select id="${inputId}" class="text_pole crt_field_input"
+                data-entity="${safeEntity}" data-field="${escapeHtml(field)}">${optionsHtml}</select>${lockCheckbox}
+        </div>`;
+    }
+
     const displayValue = Array.isArray(value) ? value.join('; ') : (value ?? '');
     return `
         <div class="crt_field_row">
             <label for="${inputId}">${escapeHtml(field)}</label>
             <input type="text" id="${inputId}" class="text_pole crt_field_input"
                 data-entity="${safeEntity}" data-field="${escapeHtml(field)}"
-                value="${escapeHtml(displayValue)}" />
-            <label class="checkbox_label crt_lock_label" title="Lock: protects this field from silent overwrite. A later proposed change is queued as a conflict instead of applied.">
-                <input type="checkbox" class="crt_lock_toggle"
-                    data-entity="${safeEntity}" data-field="${escapeHtml(field)}"
-                    ${locked ? 'checked' : ''} />
-                lock
-            </label>
+                value="${escapeHtml(displayValue)}" />${lockCheckbox}
         </div>`;
 }
 
@@ -668,6 +729,11 @@ function entityBlockHtml(name, entity) {
     const identityRows = IDENTITY_FIELDS
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
+    const bodyDetailSection = shouldShowBodyDetail(entity)
+        ? `<div class="crt_field_group"><em>Body detail</em>${BODY_DETAIL_FIELDS
+            .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
+            .join('')}</div>`
+        : '';
     const stateRows = STATE_FIELDS
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
@@ -684,6 +750,7 @@ function entityBlockHtml(name, entity) {
                 <button class="menu_button crt_delete_entity" data-entity="${safeName}">Delete</button>
             </div>
             <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
+            ${bodyDetailSection}
             <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
         </div>`;
 }
@@ -1058,8 +1125,13 @@ export async function init() {
         checkAutoExtract();
     });
 
-    eventSource.on(event_types.GENERATION_STARTED, () => {
+    eventSource.on(event_types.GENERATION_STARTED, (type) => {
+        // "quiet" covers background calls — ours (extraction) and anyone
+        // else's. None of those are what this guard needs to protect
+        // against; only real foreground chat generation counts.
+        if (type === 'quiet') return;
         mainGenerationActive = true;
+        mainGenerationStartedAt = Date.now();
     });
     eventSource.on(event_types.GENERATION_ENDED, () => {
         mainGenerationActive = false;
