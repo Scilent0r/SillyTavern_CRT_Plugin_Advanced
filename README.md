@@ -1,16 +1,6 @@
 # Character Registry Tracker (CCT v2)
 
-Solves the "SillyTavern forgets Halfrun is a she after a reboot" problem.
-Chat logs survive reboots fine — what's lost is anything that only lived in
-the model's context window. This extension keeps a small, structured,
-auto-updated fact registry per character, stored in the chat's own metadata
-(so it's on disk, not in-context), and injects it into every generation at a
-fixed depth — the same mechanism Author's Note uses — so it can't fall out of
-context the way a stray line from message #340 can.
-
-Separate from Character Card Tracker (v1). v1 does manual per-character stat
-entry for group-chat display; this does automatic fact extraction for
-long-term continuity. They can run side by side.
+Basically a plugin for SillyTavern that does automatic tracking and priorizing on multiple characters and their relationships with eachother. Excellent for longer playthrougs with multiple characters. Works well in conjunction with memorybooks. 
 
 ## Install
 
