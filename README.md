@@ -130,46 +130,6 @@ number rather than converting it.
 **Story state** (relationship_to_user, weight, status, key_facts) — the
 parts of a character expected to actually change over the story.
 
-## Body-proportion guidelines (auto, female + over 200cm)
-
-For female characters taller than 200cm, four extra read-only sections
-appear: **Height of key points** (ankle, knee, crotch, hip, breast, neck,
-chin — each measured from the ground up), **Arms and legs** (arm length,
-leg length, palm width, middle finger length, ring finger thickness),
-**Movement** (walking/running stride length and speed in km/h), and **Feet**
-(length, width, assumed EU shoe size). All four are computed live from the
-`height` field alone — nothing here is stored, locked, or sent through
-extraction, so it can never drift out of sync with height and there's no
-extra data to maintain.
-
-Key points, arms/legs, and movement all come from the same source: the
-classic "head-heights" body-scaling method (the same math behind the
-well-known GTS Converter tool). Every value is some fixed multiple of a
-reference head-height, which itself is a fixed fraction of total height.
-Reduced algebraically down to a single known target height, the reference
-baseline cancels out completely and every value becomes a pure ratio of
-total height — e.g. crotch height is exactly half of total height, arm
-length is exactly `22/68` of total height, running speed is derived from
-running stride at an assumed 9600 steps/hour, and so on. That's what's
-hardcoded for those three sections.
-
-**Feet work the other way round and use different math.** The source tool
-takes shoe size as an independent input and scales it — it never derives a
-shoe size *from* height, so there's no ratio to reduce the way there was for
-everything else. Foot length/width/EU size instead use standard real-world
-shoe-fitting approximations: foot length ≈ 15% of height, width ≈ 39% of
-foot length, EU size ≈ foot length (cm) × 1.5 + 2. These aren't from the
-uploaded calculator and are a genuine approximation rather than a derived
-identity — sanity-checked against a normal 170cm height (25.5cm foot → EU
-40, matching real shoe charts almost exactly), but treat scaled-up giant
-values as illustrative rather than exact.
-
-One other simplification: **breast height** omits the source tool's bra-cup
-correction term, which needs a cup letter we don't track as a field — it
-uses the plain ratio (`5/7` of height) instead.
-
-The 200cm/female trigger is hardcoded (not a setting) per how this was
-scoped — ask if you want it configurable.
 
 ## Layout: collapsible sections, built for large rosters
 
@@ -224,19 +184,6 @@ present with the same weight as core setting information regardless of how
 long the chat gets. It's independent of the "Enabled" toggle too, since
 that toggle only governs the auto-extracted character registry — world
 notes keep injecting even if you've paused that.
-
-## Exporting to the Height Comparison chart
-
-The **"Data-only JSON"** link (settings drawer or floating window, above
-the character list) downloads `height-comparison.json` — every tracked
-character with a height set, plus an auto-assigned display color. Open the
-Height Comparison page and use its own "Import JSON" button. Characters
-with no height yet are skipped.
-
-Stencil is picked automatically from `sex`, no manual choice involved: male
-always exports as `figure-male`; female gets a random pick each export from
-`figure-pose` / `figure-back` / `figure` (varies between exports on
-purpose); unset sex falls back to a plain `figure`.
 
 ## Critical constraints
 
