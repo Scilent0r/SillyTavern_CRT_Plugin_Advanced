@@ -12,10 +12,19 @@
 // See README.md for the full design rationale.
 
 import { getContext, extension_settings } from '../../../extensions.js';
-import { eventSource, event_types, extension_prompt_roles } from '../../../../script.js';
+import { eventSource, event_types, extension_prompt_roles, extension_prompt_types } from '../../../../script.js';
 
 const MODULE_NAME = 'character_registry_tracker';
 const EXT_PROMPT_KEY = 'CRT_REGISTRY_BLOCK';
+const WORLD_NOTES_PROMPT_KEY = 'CRT_WORLD_NOTES_BLOCK';
+const CRITICAL_FACTS_PROMPT_KEY = 'CRT_CRITICAL_FACTS_BLOCK';
+
+// In-memory only (not persisted) — which entities are EXPANDED in the UI.
+// Opt-in (rather than opt-out/collapsedEntityNames) so every character,
+// old or newly added, defaults to collapsed — the sensible default once a
+// roster gets past a couple of characters. Purely a display preference, not
+// data, so it doesn't need to survive a page reload the way locks/fields do.
+const expandedEntityNames = new Set();
 
 // Purely cosmetic grouping for the UI — behaves identically either way,
 // except BODY_DETAIL_FIELDS are conditionally hidden (see shouldShowBodyDetail).
@@ -26,12 +35,223 @@ const ALL_FIELDS = [...IDENTITY_FIELDS, ...BODY_DETAIL_FIELDS, ...STATE_FIELDS];
 const ARRAY_FIELDS = ['key_facts'];
 const SEX_OPTIONS = ['', 'male', 'female']; // '' = unset
 
+// Stencil for the standalone Height Comparison export is fully automatic
+// (sex-based, see pickStencilForExport) — no per-character manual override.
+const DEFAULT_STENCIL = 'figure'; // fallback when sex isn't set
+
+// Cycled deterministically by export order so entries land on distinct
+// colors without needing a color picker in this UI.
+const EXPORT_COLOR_PALETTE = ['#2E5C8A', '#B5502F', '#3E7A4C', '#C79A2E', '#6B4E8A', '#5B6B7B', '#1D3E5C', '#8A2E4E'];
+
+// ---------------------------------------------------------------------------
+// Inter-character relationships — a shared graph, not a per-character field.
+//
+// Why: relationship_to_user works fine because there's only ever one "other
+// party" (the user), so a single string field per character never
+// contradicts itself. Relationships BETWEEN tracked characters have no such
+// guarantee — two independent free-text facts ("Halfrun's child: Runa" on
+// one card, "Runa's parent: Halfrun" on another) can drift apart across
+// extraction passes, and previously the only place for this kind of fact was
+// key_facts, an array that gets wholesale-replaced (not merged) every pass.
+// That's the actual mechanism behind parents/children getting mixed up.
+//
+// Fix: one canonical edge per relationship, stored once at the registry
+// level (not owned by either character), with a fixed small vocabulary of
+// types so a small/finetuned model has an unambiguous, bounded choice rather
+// than open-ended prose. Both directions are derived from the SAME edge at
+// render time — there is nothing for two copies to disagree about, because
+// there's only ever one copy. A canonical dedup key means re-extracting the
+// same real-world fact updates the one existing edge instead of spawning a
+// contradictory duplicate.
+// ---------------------------------------------------------------------------
+
+const RELATIONSHIP_TYPES = ['parent_child', 'spouse', 'sibling', 'other'];
+const RELATIONSHIP_TYPE_LABELS = {
+    parent_child: 'Parent / Child',
+    spouse: 'Spouse',
+    sibling: 'Sibling',
+    other: 'Other (custom label)',
+};
+
+// Canonical, direction-aware dedup key. parent_child and "other" are
+// directional (order matters); spouse/sibling are symmetric (sorted so
+// A-B and B-A land on the same edge).
+function relationshipKey(rel) {
+    if (rel.type === 'parent_child') return `parent_child:${rel.parent}>${rel.child}`;
+    if (rel.type === 'other') return `other:${rel.a}>${rel.b}`;
+    const pair = [rel.a, rel.b].sort();
+    return `${rel.type}:${pair[0]}|${pair[1]}`;
+}
+
+function relationshipParticipants(rel) {
+    if (rel.type === 'parent_child') return [rel.parent, rel.child];
+    return [rel.a, rel.b];
+}
+
+// The actual text a model (or a person) reads. Both directions are stated
+// explicitly for asymmetric types rather than left for the reader to infer —
+// redundant, but redundancy is exactly what disambiguates a small model.
+function relationshipSentence(rel) {
+    switch (rel.type) {
+        case 'parent_child':
+            return `${rel.parent} is ${rel.child}'s parent. ${rel.child} is ${rel.parent}'s child.`;
+        case 'spouse':
+            return `${rel.a} is married to ${rel.b}.`;
+        case 'sibling':
+            return `${rel.a} and ${rel.b} are siblings.`;
+        case 'other':
+        default:
+            return `${rel.a} is ${rel.label || 'connected to'} ${rel.b}.`;
+    }
+}
+
+// Fields stored/displayed as "<number><unit>" — the number is validated and
+// the unit is always appended by the extension itself, never typed by hand.
+const UNIT_FIELDS = { height: 'cm', weight: 'kg', bust: 'cm', waist: 'cm', hip: 'cm' };
+
+// Extracts the leading non-negative number from a value, or null if none.
+function extractNumber(rawValue) {
+    const str = String(rawValue ?? '').trim();
+    if (!str) return null;
+    const match = str.match(/\d+(\.\d+)?/);
+    return match ? match[0] : null;
+}
+
+// Full normalized form for storage/injection, e.g. "175" + "cm" -> "175cm".
+function normalizeMeasurement(rawValue, unit) {
+    const num = extractNumber(rawValue);
+    return num ? `${num}${unit}` : null;
+}
+
+// ---------------------------------------------------------------------------
+// Body-proportion guidelines (auto, female + height > 200cm)
+//
+// Derived from the classic "head-heights" scaling method used by the GTS
+// Converter tool: every body-point height and limb length is expressed as a
+// ratio of a baseline height, scaled by (targetHeight / baselineHeight). When
+// you reduce that algebraically for a single known target height (rather
+// than scaling from a separate reference photo, which the original tool was
+// built for), the baseline cancels out completely — every value collapses to
+// a fixed ratio of total height. That's what's hardcoded below.
+//
+// Read-only and never stored: always recomputed live from the "height"
+// field, never sent through extraction, never lockable. Two source fields
+// (foot width/length) are omitted — the original tool derives those from an
+// independent shoe-size input we don't track, so they can't be reduced to a
+// pure height ratio the same way.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Body-proportion guidelines (auto, female + height > 200cm)
+//
+// Derived from the classic "head-heights" scaling method used by the GTS
+// Converter tool: every body-point height and limb length is expressed as a
+// ratio of a baseline height, scaled by (targetHeight / baselineHeight). When
+// you reduce that algebraically for a single known target height (rather
+// than scaling from a separate reference photo, which the original tool was
+// built for), the baseline cancels out completely — every value collapses to
+// a fixed ratio of total height. That's what's hardcoded below for key
+// points, arms/legs, and movement (stride + speed).
+//
+// Feet are different: the source tool takes shoe size as an independent
+// INPUT and scales it — it never derives shoe size FROM height, so there's
+// no ratio to reduce. Foot length/width/EU size below are standard
+// real-world approximations instead (documented at FOOT_RATIOS), not
+// sourced from the uploaded calculator.
+//
+// Everything here is read-only and never stored: always recomputed live
+// from the "height" field, never sent through extraction, never lockable.
+// ---------------------------------------------------------------------------
+
+const PROPORTION_HEIGHT_THRESHOLD_CM = 200;
+
+const KEY_POINT_RATIOS = {
+    ankle: 1 / 21,
+    knee: 1.875 / 7,
+    crotch: 3.5 / 7,
+    hip: 4 / 7,
+    breast: 5 / 7, // simplified: source tool also applies a bra-cup correction term we can't reproduce without a tracked cup letter
+    neck: 5.75 / 7,
+    chin: 6 / 7,
+};
+const KEY_POINT_LABELS = {
+    ankle: 'Ankle', knee: 'Knee', crotch: 'Crotch', hip: 'Hip',
+    breast: 'Breast', neck: 'Neck', chin: 'Chin',
+};
+
+const ARM_LEG_RATIOS = {
+    armLength: 22 / 68,
+    legLength: 3.5 / 7, // crotch to floor — same ratio as the crotch key point, listed separately per the source tool
+    palmWidth: 0.525 / 9.2,
+    fingerLength: 0.475 / 9.2,
+    ringThickness: 0.68 / 68,
+};
+const ARM_LEG_LABELS = {
+    armLength: 'Arm length', legLength: 'Leg length (crotch to floor)',
+    palmWidth: 'Palm width', fingerLength: 'Middle finger length', ringThickness: 'Ring finger thickness',
+};
+
+// Stride lengths reduce the same way as everything above. Speed is stride
+// times an assumed step cadence (7200 steps/hour walking, 9600 running —
+// the source tool's own assumption), converted to km/h.
+const MOVEMENT_STRIDE_RATIOS = { walkStride: 26.5 / 68, runStride: 66 / 68 };
+const MOVEMENT_STEPS_PER_HOUR = { walkStride: 7200, runStride: 9600 };
+const MOVEMENT_LABELS = {
+    walkStride: 'Walking stride', runStride: 'Running stride',
+    walkSpeed: 'Walking speed', runSpeed: 'Running speed',
+};
+
+// Real-world approximations, not from the source calculator (see note
+// above): foot length ~15% of height; width ~39% of foot length; EU size
+// from the standard "cm × 1.5 + 2" shoe-fitting rule of thumb.
+const FOOT_LENGTH_RATIO = 0.15;
+const FOOT_WIDTH_RATIO = 0.39;
+const FOOT_LABELS = { length: 'Foot length', width: 'Foot width', euSize: 'Assumed EU shoe size' };
+
+function shouldShowProportions(entity) {
+    if (entity.fields.sex !== 'female') return false;
+    const heightNum = extractNumber(entity.fields.height);
+    return heightNum !== null && Number(heightNum) > PROPORTION_HEIGHT_THRESHOLD_CM;
+}
+
+function computeProportions(heightCm) {
+    const round1 = (n) => Math.round(n * 10) / 10;
+
+    const keyPoints = {};
+    for (const [key, ratio] of Object.entries(KEY_POINT_RATIOS)) {
+        keyPoints[key] = round1(heightCm * ratio);
+    }
+
+    const armsLegs = {};
+    for (const [key, ratio] of Object.entries(ARM_LEG_RATIOS)) {
+        armsLegs[key] = round1(heightCm * ratio);
+    }
+
+    const movement = {};
+    for (const [key, ratio] of Object.entries(MOVEMENT_STRIDE_RATIOS)) {
+        const strideCm = heightCm * ratio;
+        movement[key] = round1(strideCm);
+        const speedKey = key === 'walkStride' ? 'walkSpeed' : 'runSpeed';
+        movement[speedKey] = round1((strideCm * MOVEMENT_STEPS_PER_HOUR[key]) / 100000); // cm/hour -> km/h
+    }
+
+    const footLengthCm = heightCm * FOOT_LENGTH_RATIO;
+    const feet = {
+        length: round1(footLengthCm),
+        width: round1(footLengthCm * FOOT_WIDTH_RATIO),
+        euSize: Math.round(footLengthCm * 1.5 + 2),
+    };
+
+    return { keyPoints, armsLegs, movement, feet };
+}
+
 const defaultSettings = {
     enabled: true,
     autoExtract: true,
     extractEveryN: 30,       // messages since last extraction before auto-firing
     extractionWindow: 40,    // how many recent messages get sent to the extractor
     injectionDepth: 1,       // depth 0-2 stays closest to the strongest-attention zone (see README)
+    criticalFactsDepth: 0,   // deliberately even closer than injectionDepth — see README "Critical constraints"
     injectionRole: extension_prompt_roles.SYSTEM,
     floatingPanelOpen: false,
     floatingPanelPos: null,  // { top, left } in px, persisted across sessions
@@ -47,11 +267,17 @@ const defaultSettings = {
 // keys/values) so we don't have to hand-encode every field name into the
 // grammar and risk it going stale as fields change.
 const JSON_SHAPE_GRAMMAR = `
-root    ::= "{" ws "\\"updates\\"" ws ":" ws updates ws "}" ws
+root    ::= "{" ws "\\"updates\\"" ws ":" ws updates (ws "," ws "\\"relationships\\"" ws ":" ws relationships)? ws "}" ws
 updates ::= "{" ws (pair ("," ws pair)*)? "}" ws
 pair    ::= string ":" ws fields
 fields  ::= "{" ws (fpair ("," ws fpair)*)? "}" ws
 fpair   ::= string ":" ws value
+
+relationships ::=
+  "[" ws (
+            fields
+    ("," ws fields)*
+  )? "]" ws
 
 value  ::= object | array | string | number | ("true" | "false" | "null") ws
 
@@ -103,6 +329,9 @@ function emptyRegistry() {
         entities: {},          // name -> { fields: {}, locks: {}, included: true }
         lastExtractedIndex: 0, // index into context.chat up to which we've extracted
         pendingConflicts: [],  // proposed changes to locked fields awaiting confirmation
+        worldNotes: { text: '', locked: false }, // freeform, manual-only, never touched by extraction
+        relationships: [],               // shared graph of inter-character relationship edges
+        pendingRelationshipConflicts: [], // proposed changes to locked edges awaiting confirmation
     };
 }
 
@@ -117,6 +346,9 @@ function getRegistry() {
         entities: existing.entities ?? {},
         lastExtractedIndex: existing.lastExtractedIndex ?? 0,
         pendingConflicts: existing.pendingConflicts ?? [],
+        worldNotes: existing.worldNotes ?? { text: '', locked: false },
+        relationships: existing.relationships ?? [],
+        pendingRelationshipConflicts: existing.pendingRelationshipConflicts ?? [],
     };
 }
 
@@ -134,7 +366,11 @@ function ensureEntity(registry, name) {
             fields: {},
             locks: {},
             included: true,
+            criticalFacts: [], // manual-only hard constraints — never touched by extraction, see README
         };
+    }
+    if (!registry.entities[name].criticalFacts) {
+        registry.entities[name].criticalFacts = [];
     }
     return registry.entities[name];
 }
@@ -178,6 +414,12 @@ function buildExtractionPrompt(chatSlice, registry) {
         currentRegistry[name] = entity.fields;
     }
 
+    const currentRelationships = registry.relationships.map(rel => ({
+        type: rel.type,
+        ...(rel.type === 'parent_child' ? { parent: rel.parent, child: rel.child } : { a: rel.a, b: rel.b }),
+        ...(rel.type === 'other' ? { label: rel.label } : {}),
+    }));
+
     return [
         'You maintain a structured fact registry about the characters in a roleplay chat.',
         'Below is the current registry (may be empty) and a recent slice of the chat transcript.',
@@ -190,19 +432,39 @@ function buildExtractionPrompt(chatSlice, registry) {
         `      "bust": "...", "waist": "...", "hip": "...",`,
         `      "relationship_to_user": "...", "weight": "...", "status": "...", "key_facts": ["..."]`,
         '    }',
-        '  }',
+        '  },',
+        '  "relationships": [',
+        '    { "type": "parent_child", "parent": "<name>", "child": "<name>" },',
+        '    { "type": "spouse", "a": "<name>", "b": "<name>" },',
+        '    { "type": "sibling", "a": "<name>", "b": "<name>" },',
+        '    { "type": "other", "a": "<name>", "b": "<name>", "label": "<short verb phrase, e.g. \\"mentor of\\", \\"rival of\\", \\"employer of\\">" }',
+        '  ]',
         '}',
         '',
-        'Rules:',
+        'Rules for "updates":',
         '- For each character who appears in this transcript slice, include your best current understanding of every field you have information for — whether or not the registry already has a value for it. It is fine (and expected) to re-state a field that has not changed.',
         '- Omit a field entirely if the transcript gives no information about it, rather than guessing.',
         '- "physique" (general build, e.g. "athletic", "stocky", "slender") applies to any character.',
         '- "sex" must be exactly "male" or "female" if it can be determined from the transcript. Omit it if unclear.',
-        '- "bust", "waist", "hip" are specific body measurements. Only include them for characters whose "sex" is female AND only when the transcript actually gives that information. Never invent numbers — omit all three rather than guess.',
+        '- "height" and "weight" must be given as a plain number only, in centimeters and kilograms respectively (e.g. "180", not "180cm" or "5\'11\""). Convert from imperial if the transcript uses it. Omit if not determinable as a number.',
+        '- "bust", "waist", "hip" are specific body measurements, each a plain number in centimeters only (e.g. "86", not "86cm"). Only include them for characters whose "sex" is female AND only when the transcript actually gives that information. Never invent numbers — omit all three rather than guess.',
         '- Only include characters who actually appear in this transcript slice.',
+        '- "relationship_to_user" is ONLY for that character\'s relationship to {{user}}. Never describe a relationship between two OTHER tracked characters here — that always goes in the separate "relationships" array below instead, never as a key_facts entry either.',
+        '',
+        'Rules for "relationships" — this is a separate, structured fact store for relationships BETWEEN tracked characters (never involving {{user}}):',
+        '- "type" must be exactly one of: "parent_child", "spouse", "sibling", "other". Nothing else.',
+        '- "parent_child" uses "parent" and "child" (not "a"/"b") — get the direction right; this is the one the reader most needs unambiguous.',
+        '- "spouse" and "sibling" use "a" and "b" — order between them does not matter.',
+        '- "other" is for anything that doesn\'t fit the above (mentor, rival, employer, friend, enemy, etc.) — use "a", "b", and a short "label" verb-phrase such that "A is <label> B" reads naturally.',
+        '- Only include a relationship if the transcript actually states or clearly implies it. Never guess a family/social structure that wasn\'t established.',
+        '- Re-state a relationship you already knew about (from "Current relationships" below) if it\'s still true — this keeps it from being forgotten. Do not invent a new one that contradicts an existing entry unless the transcript explicitly changed it.',
+        '- Every name used here must be one of the tracked characters listed in "Current registry" below (or a character you are also introducing in this same "updates" object). Do not invent participants.',
         '',
         '### Current registry',
         JSON.stringify(currentRegistry, null, 2),
+        '',
+        '### Current relationships',
+        JSON.stringify(currentRelationships, null, 2),
         '',
         '### Recent transcript',
         transcript,
@@ -284,6 +546,14 @@ function mergeExtractionResult(registry, result) {
                 proposed = normalized;
             }
 
+            // height/weight/bust/waist/hip must be "<number><unit>" — reject
+            // anything with no extractable number rather than storing free text.
+            if (UNIT_FIELDS[field]) {
+                const normalized = normalizeMeasurement(proposed, UNIT_FIELDS[field]);
+                if (!normalized) continue;
+                proposed = normalized;
+            }
+
             // Belt-and-suspenders: even if the model ignores the prompt's
             // instruction, never store body-detail fields for a non-female
             // entity — keeps stored data consistent with what's ever visible.
@@ -322,6 +592,116 @@ function mergeExtractionResult(registry, result) {
         if (entityTouched) touched++;
     }
 
+    return { registry, touched };
+}
+
+// Validates a single proposed relationship has the fields its type needs and
+// every participant it names is (or will be) a known entity — silently
+// dropping anything malformed rather than storing a half-formed edge.
+// Case/whitespace-forgiving lookup — a manually-typed name only needs to
+// match a tracked entity approximately; returns the entity's *canonical*
+// key (correct original casing) so stored relationships stay consistent
+// with how that character is actually keyed, or null if there's no match.
+function resolveEntityName(registry, rawName) {
+    const trimmed = String(rawName || '').trim();
+    if (!trimmed) return null;
+    if (registry.entities[trimmed]) return trimmed;
+    const lower = trimmed.toLowerCase();
+    return Object.keys(registry.entities).find(n => n.toLowerCase() === lower) || null;
+}
+
+function isValidRelationshipShape(rel, registry) {
+    if (!rel || typeof rel !== 'object' || !RELATIONSHIP_TYPES.includes(rel.type)) return false;
+    const roleKeys = rel.type === 'parent_child' ? ['parent', 'child'] : ['a', 'b'];
+    const resolved = {};
+    for (const key of roleKeys) {
+        const canonical = resolveEntityName(registry, rel[key]);
+        if (!canonical) return false; // not a tracked entity — don't store a dangling reference
+        resolved[key] = canonical;
+    }
+    if (resolved[roleKeys[0]] === resolved[roleKeys[1]]) return false; // no self-relationships
+    Object.assign(rel, resolved); // normalize to canonical casing in place
+    return true;
+}
+
+// For parent_child and spouse specifically: does a DIFFERENT, locked edge
+// already claim this same "slot" (this child's parent; this person's
+// spouse)? A same-key update is handled separately above — this catches the
+// other half of the bug: a NEW, differently-keyed edge that silently
+// contradicts an already-confirmed one, rather than an edit to it. Sibling
+// and "other" are deliberately not restricted this way since having several
+// is normal for those, not a sign of a mixed-up fact.
+function findConflictingLockedEdge(registry, rel) {
+    if (rel.type === 'parent_child') {
+        return registry.relationships.find(r =>
+            r.type === 'parent_child' && r.locked && r.child === rel.child && r.parent !== rel.parent);
+    }
+    if (rel.type === 'spouse') {
+        const key = relationshipKey(rel);
+        return registry.relationships.find(r => {
+            if (r.type !== 'spouse' || !r.locked || relationshipKey(r) === key) return false;
+            return [r.a, r.b].includes(rel.a) || [r.a, r.b].includes(rel.b);
+        });
+    }
+    return null;
+}
+
+function mergeRelationships(registry, proposedRelationships) {
+    let touched = 0;
+    for (const raw of proposedRelationships || []) {
+        if (!isValidRelationshipShape(raw, registry)) continue;
+
+        const rel = { ...raw };
+        const key = relationshipKey(rel);
+        const existingIndex = registry.relationships.findIndex(r => relationshipKey(r) === key);
+        const existing = existingIndex === -1 ? null : registry.relationships[existingIndex];
+
+        if (existing) {
+            if (!existing.locked) {
+                // Same key, so type/participants already match — only the
+                // label (for "other") can meaningfully differ between passes.
+                if (existing.label !== rel.label) {
+                    existing.label = rel.label;
+                    touched++;
+                }
+                continue;
+            }
+            // Locked: only surface it if the proposal actually disagrees.
+            if (existing.label !== rel.label) {
+                registry.pendingRelationshipConflicts.push({
+                    id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                    relationshipId: existing.id,
+                    newLabel: rel.label,
+                    oldSentence: relationshipSentence(existing),
+                    newSentence: relationshipSentence(rel),
+                });
+            }
+            continue;
+        }
+
+        // New key. Before adding it as a fresh fact, make sure it doesn't
+        // silently contradict an already-locked, differently-keyed edge —
+        // e.g. this child already has a different confirmed, locked parent.
+        const conflictingEdge = findConflictingLockedEdge(registry, rel);
+        if (conflictingEdge) {
+            registry.pendingRelationshipConflicts.push({
+                id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                relationshipId: conflictingEdge.id,
+                isNewContradictingEdge: true,
+                proposedEdge: rel,
+                oldSentence: relationshipSentence(conflictingEdge),
+                newSentence: relationshipSentence(rel),
+            });
+            continue;
+        }
+
+        registry.relationships.push({
+            id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            ...rel,
+            locked: false,
+        });
+        touched++;
+    }
     return { registry, touched };
 }
 
@@ -548,6 +928,14 @@ async function runExtractionInner(manual) {
         return;
     }
 
+    let relationshipsTouched = 0;
+    try {
+        ({ touched: relationshipsTouched } = mergeRelationships(registry, parsed.value.relationships));
+    } catch (err) {
+        reportError('MERGE_FAILED', err);
+        return;
+    }
+
     try {
         registry.lastExtractedIndex = chat.length;
         saveRegistry(registry);
@@ -558,7 +946,7 @@ async function runExtractionInner(manual) {
 
     updateInjection();
     renderEntityList();
-    setStatus(`✓ Registry updated (${touched} character(s) touched).`, 'ok');
+    setStatus(`✓ Registry updated (${touched} character(s), ${relationshipsTouched} relationship(s) touched).`, 'ok');
 }
 
 function tryParseAndValidate(rawResult) {
@@ -629,6 +1017,14 @@ function formatEntityLine(name, entity) {
         parts.push(`Facts: ${f.key_facts.join('; ')}`);
     }
 
+    if (shouldShowProportions(entity)) {
+        const { keyPoints, armsLegs, movement, feet } = computeProportions(Number(extractNumber(f.height)));
+        parts.push(`Body-point heights from ground: ankle ${keyPoints.ankle}cm, knee ${keyPoints.knee}cm, crotch ${keyPoints.crotch}cm, hip ${keyPoints.hip}cm, breast ${keyPoints.breast}cm, neck ${keyPoints.neck}cm, chin ${keyPoints.chin}cm`);
+        parts.push(`Arm length ${armsLegs.armLength}cm, leg length (crotch to floor) ${armsLegs.legLength}cm, palm width ${armsLegs.palmWidth}cm, middle finger length ${armsLegs.fingerLength}cm`);
+        parts.push(`Walking stride ${movement.walkStride}cm at ${movement.walkSpeed}km/h, running stride ${movement.runStride}cm at ${movement.runSpeed}km/h`);
+        parts.push(`Feet approx. ${feet.length}cm long, ${feet.width}cm wide (EU ${feet.euSize})`);
+    }
+
     return `${name}: ${parts.join('. ')}`;
 }
 
@@ -639,14 +1035,53 @@ function hasAnyField(entity) {
     });
 }
 
+function buildRelationshipsInjectionText(registry) {
+    const lines = registry.relationships
+        .filter(rel => {
+            const [p1, p2] = relationshipParticipants(rel);
+            const e1 = registry.entities[p1];
+            const e2 = registry.entities[p2];
+            return e1 && e1.included && e2 && e2.included;
+        })
+        .map(relationshipSentence);
+
+    if (lines.length === 0) return '';
+    return ['[Relationships]', ...lines, '[/Relationships]'].join('\n');
+}
+
 function buildInjectionText(registry) {
     const lines = Object.entries(registry.entities)
         .filter(([, entity]) => entity.included && hasAnyField(entity))
         .map(([name, entity]) => formatEntityLine(name, entity));
 
-    if (lines.length === 0) return '';
+    const parts = [];
+    if (lines.length > 0) {
+        parts.push(['[Character Registry]', ...lines, '[/Character Registry]'].join('\n'));
+    }
 
-    return ['[Character Registry]', ...lines, '[/Character Registry]'].join('\n');
+    const relationshipsText = buildRelationshipsInjectionText(registry);
+    if (relationshipsText) parts.push(relationshipsText);
+
+    return parts.join('\n');
+}
+
+function buildWorldNotesInjectionText(registry) {
+    const text = (registry.worldNotes && registry.worldNotes.text || '').trim();
+    if (!text) return '';
+    return `[World Info]\n${text}\n[/World Info]`;
+}
+
+function buildCriticalFactsInjectionText(registry) {
+    const lines = [];
+    for (const [name, entity] of Object.entries(registry.entities)) {
+        if (!entity.included) continue;
+        for (const fact of entity.criticalFacts || []) {
+            if (!fact) continue;
+            lines.push(`MUST NOT be contradicted — ${name}: ${fact}.`);
+        }
+    }
+    if (lines.length === 0) return '';
+    return ['[Critical Constraints]', ...lines, '[/Critical Constraints]'].join('\n');
 }
 
 function updateInjection() {
@@ -654,14 +1089,82 @@ function updateInjection() {
     const context = getContext();
     const registry = getRegistry();
 
-    if (!settings.enabled) {
-        context.setExtensionPrompt(EXT_PROMPT_KEY, '', 1, settings.injectionDepth, false, settings.injectionRole);
+    const registryText = settings.enabled ? buildInjectionText(registry) : '';
+    context.setExtensionPrompt(EXT_PROMPT_KEY, registryText, extension_prompt_types.IN_CHAT, settings.injectionDepth, false, settings.injectionRole);
+
+    // World notes are independent of the "enabled" toggle above (that toggle
+    // is specifically about the auto-extracted character registry) and use
+    // IN_PROMPT rather than a chat depth — that anchors it next to the
+    // scenario/description in the assembled prompt instead of scrolling
+    // through chat history, which is the "most important level" placement
+    // this kind of always-true world/setting fact calls for.
+    const worldNotesText = buildWorldNotesInjectionText(registry);
+    context.setExtensionPrompt(WORLD_NOTES_PROMPT_KEY, worldNotesText, extension_prompt_types.IN_PROMPT, 0, false, settings.injectionRole);
+
+    // Critical constraints get their OWN, even closer depth than the
+    // character registry, and are independent of "enabled" too (manual-only
+    // data, like world notes — see README "Critical constraints").
+    const criticalFactsText = buildCriticalFactsInjectionText(registry);
+    context.setExtensionPrompt(CRITICAL_FACTS_PROMPT_KEY, criticalFactsText, extension_prompt_types.IN_CHAT, settings.criticalFactsDepth, false, settings.injectionRole);
+}
+
+// ---------------------------------------------------------------------------
+// Export — standalone Height Comparison tool (separate static HTML page,
+// not embedded in ST). Plain JSON in the shape the chart page's own Import
+// JSON button already expects. Only name + height + the manually-chosen
+// stencil ever leave this registry; "custom" stencils (uploaded images)
+// aren't offered since we have none.
+// ---------------------------------------------------------------------------
+
+function exportableEntities(registry) {
+    return Object.entries(registry.entities)
+        .filter(([, entity]) => extractNumber(entity.fields.height) !== null)
+        .sort(([a], [b]) => a.localeCompare(b));
+}
+
+// Sex-based stencil for export, overriding the manual per-character pick
+// when sex is known (falls back to the manual dropdown otherwise).
+const FEMALE_STENCIL_OPTIONS = ['figure-pose', 'figure-back', 'figure'];
+
+function pickStencilForExport(entity) {
+    const sex = entity.fields.sex;
+    if (sex === 'male') return 'figure-male';
+    if (sex === 'female') return FEMALE_STENCIL_OPTIONS[Math.floor(Math.random() * FEMALE_STENCIL_OPTIONS.length)];
+    return DEFAULT_STENCIL;
+}
+
+function buildHeightChartExport(registry) {
+    const entries = exportableEntities(registry).map(([name, entity], i) => ({
+        id: `crt_${i}_${Date.now()}`,
+        name,
+        heightCm: Number(extractNumber(entity.fields.height)),
+        color: EXPORT_COLOR_PALETTE[i % EXPORT_COLOR_PALETTE.length],
+        stencil: pickStencilForExport(entity),
+        customImage: null,
+    }));
+    return { settings: { unit: 'metric', pxPerCm: 2.0 }, entries };
+}
+
+function exportHeightChart() {
+    const registry = getRegistry();
+    const data = buildHeightChartExport(registry);
+
+    if (data.entries.length === 0) {
+        setStatus('No tracked characters have a height set yet — nothing to export.', 'error');
         return;
     }
 
-    const text = buildInjectionText(registry);
-    // position 1 === extension_prompt_types.IN_CHAT (same mechanism Author's Note uses)
-    context.setExtensionPrompt(EXT_PROMPT_KEY, text, 1, settings.injectionDepth, false, settings.injectionRole);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'height-comparison.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    setStatus(`✓ Exported ${data.entries.length} character(s) to height-comparison.json — open the Height Comparison page and use its "Import JSON" button.`, 'ok');
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +1205,21 @@ function fieldRowHtml(entityName, field, value, locked) {
         </div>`;
     }
 
+    if (UNIT_FIELDS[field]) {
+        const unit = UNIT_FIELDS[field];
+        const numericOnly = extractNumber(value) ?? '';
+        return `
+        <div class="crt_field_row">
+            <label for="${inputId}">${escapeHtml(field)}</label>
+            <div class="crt_unit_input_wrap">
+                <input type="text" inputmode="decimal" id="${inputId}" class="text_pole crt_field_input crt_unit_input"
+                    data-entity="${safeEntity}" data-field="${escapeHtml(field)}"
+                    value="${escapeHtml(numericOnly)}" placeholder="e.g. 175" />
+                <span class="crt_unit_suffix">${unit}</span>
+            </div>${lockCheckbox}
+        </div>`;
+    }
+
     const displayValue = Array.isArray(value) ? value.join('; ') : (value ?? '');
     return `
         <div class="crt_field_row">
@@ -724,8 +1242,153 @@ function conflictRowHtml(conflict) {
         </div>`;
 }
 
-function entityBlockHtml(name, entity) {
+function relationshipRowHtml(rel) {
+    const safeId = escapeHtml(rel.id);
+    const labelInput = rel.type === 'other'
+        ? `<input type="text" class="text_pole crt_relationship_label_input" data-id="${safeId}" value="${escapeHtml(rel.label || '')}" placeholder="e.g. mentor of" />`
+        : '';
+    return `
+        <div class="crt_relationship_row" data-id="${safeId}">
+            <div class="crt_relationship_sentence">${escapeHtml(relationshipSentence(rel))}</div>
+            ${labelInput}
+            <label class="checkbox_label crt_lock_label" title="Lock: protects this fact. A later proposal that contradicts it (a new edge, or a changed label) is queued below for you to accept/reject instead of applied silently.">
+                <input type="checkbox" class="crt_relationship_lock" data-id="${safeId}" ${rel.locked ? 'checked' : ''} />
+                lock
+            </label>
+            <button class="menu_button crt_relationship_delete" data-id="${safeId}">Delete</button>
+        </div>`;
+}
+
+function buildRelationshipListHtml(registry) {
+    if (registry.relationships.length === 0) {
+        return '<div class="crt_empty">No relationships tracked yet.</div>';
+    }
+    return registry.relationships.map(relationshipRowHtml).join('');
+}
+
+// Populates the two name dropdowns in an "Add relationship" row from
+// currently tracked characters — a dropdown can't typo or mis-case a name
+// the way free text could, so this replaces what used to be manual entry
+// plus a forgiving lookup. Placeholder option text swaps to Parent/Child
+// for that type, First/Second person otherwise. Preserves the current
+// selection across a refresh where possible.
+function populateRelationshipNameSelects($row, registry) {
+    const type = $row.find('.crt_add_relationship_type').val();
+    const isParentChild = type === 'parent_child';
+    const label1 = isParentChild ? 'Parent' : 'First person';
+    const label2 = isParentChild ? 'Child' : 'Second person';
+    const names = Object.keys(registry.entities).sort();
+
+    const optionsHtml = (placeholderLabel) => [
+        `<option value="" disabled>${escapeHtml(placeholderLabel)}</option>`,
+        ...names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`),
+    ].join('');
+
+    const $sel1 = $row.find('.crt_add_relationship_name1');
+    const $sel2 = $row.find('.crt_add_relationship_name2');
+    const prev1 = $sel1.val();
+    const prev2 = $sel2.val();
+
+    $sel1.html(optionsHtml(label1));
+    $sel2.html(optionsHtml(label2));
+
+    $sel1.val(names.includes(prev1) ? prev1 : '');
+    $sel2.val(names.includes(prev2) ? prev2 : '');
+}
+
+function relationshipConflictRowHtml(conflict) {
+    return `
+        <div class="crt_conflict_row" data-id="${escapeHtml(conflict.id)}">
+            Locked relationship: "${escapeHtml(conflict.oldSentence)}" — extraction proposed instead:
+            "${escapeHtml(conflict.newSentence)}".
+            <button class="menu_button crt_relationship_conflict_accept" data-id="${escapeHtml(conflict.id)}">Accept new</button>
+            <button class="menu_button crt_relationship_conflict_reject" data-id="${escapeHtml(conflict.id)}">Keep existing</button>
+        </div>`;
+}
+
+function buildRelationshipConflictListHtml(registry) {
+    if (registry.pendingRelationshipConflicts.length === 0) return '';
+    const rows = registry.pendingRelationshipConflicts.map(relationshipConflictRowHtml).join('');
+    return `<h4 class="crt_conflict_heading">⚠ Pending relationship conflicts (${registry.pendingRelationshipConflicts.length})</h4>${rows}`;
+}
+
+function proportionRowHtml(label, value, unit = 'cm') {
+    const display = unit ? `${value} ${unit}` : String(value);
+    return `<div class="crt_proportion_row"><span>${escapeHtml(label)}</span><span>${escapeHtml(display)}</span></div>`;
+}
+
+function proportionsBlockHtml(entity) {
+    if (!shouldShowProportions(entity)) return '';
+    const { keyPoints, armsLegs, movement, feet } = computeProportions(Number(extractNumber(entity.fields.height)));
+
+    const keyPointRows = Object.entries(keyPoints)
+        .map(([k, v]) => proportionRowHtml(KEY_POINT_LABELS[k], v))
+        .join('');
+    const armLegRows = Object.entries(armsLegs)
+        .map(([k, v]) => proportionRowHtml(ARM_LEG_LABELS[k], v))
+        .join('');
+    const movementRows = [
+        proportionRowHtml(MOVEMENT_LABELS.walkStride, movement.walkStride),
+        proportionRowHtml(MOVEMENT_LABELS.walkSpeed, movement.walkSpeed, 'km/h'),
+        proportionRowHtml(MOVEMENT_LABELS.runStride, movement.runStride),
+        proportionRowHtml(MOVEMENT_LABELS.runSpeed, movement.runSpeed, 'km/h'),
+    ].join('');
+    const feetRows = [
+        proportionRowHtml(FOOT_LABELS.length, feet.length),
+        proportionRowHtml(FOOT_LABELS.width, feet.width),
+        proportionRowHtml(FOOT_LABELS.euSize, feet.euSize, ''),
+    ].join('');
+
+    return `
+        <div class="crt_field_group">
+            <em>Proportions (auto — female, height over ${PROPORTION_HEIGHT_THRESHOLD_CM}cm)</em>
+            <div class="crt_hint">Read-only, recalculated live from height. Never stored, locked, or sent to extraction.</div>
+            <div class="crt_proportion_subhead">Height of key points (from the ground up)</div>
+            ${keyPointRows}
+            <div class="crt_proportion_subhead">Arms and legs</div>
+            ${armLegRows}
+            <div class="crt_proportion_subhead">Movement</div>
+            ${movementRows}
+            <div class="crt_proportion_subhead">Feet (assumed — real-world approximation, not exact)</div>
+            ${feetRows}
+        </div>`;
+}
+
+function criticalFactsBlockHtml(name, entity) {
     const safeName = escapeHtml(name);
+    const facts = entity.criticalFacts || [];
+    const rows = facts.map((fact, i) => `
+        <div class="crt_critical_fact_row" data-entity="${safeName}" data-index="${i}">
+            <span class="crt_critical_fact_text">${escapeHtml(fact)}</span>
+            <button class="menu_button crt_critical_fact_delete" data-entity="${safeName}" data-index="${i}">Delete</button>
+        </div>`).join('');
+
+    return `
+        <div class="crt_field_group crt_critical_facts_group">
+            <em>Critical constraints (manual, never touched by extraction)</em>
+            <div class="crt_hint">Injected as an explicit "MUST NOT be contradicted" rule, at a closer/stronger position than the rest of this character's data — for hard physical or behavioral limits the model keeps ignoring otherwise (e.g. a giant sleeping in a normal bed). Keep each entry short and concrete.</div>
+            ${rows || '<div class="crt_empty">None yet.</div>'}
+            <div class="crt_add_critical_fact_row">
+                <input type="text" class="text_pole crt_add_critical_fact_input" data-entity="${safeName}" placeholder="e.g. cannot fit inside buildings, doorways, or furniture — he is 50m tall" />
+                <button class="menu_button crt_add_critical_fact_btn" data-entity="${safeName}">Add</button>
+            </div>
+        </div>`;
+}
+
+function entitySummaryLine(entity, relCount) {
+    const f = entity.fields;
+    const bits = [f.sex, f.age ? `${f.age}y` : null, f.height || null].filter(Boolean);
+    const counts = [];
+    if (relCount > 0) counts.push(`${relCount} relationship${relCount === 1 ? '' : 's'}`);
+    const factCount = (entity.criticalFacts || []).length;
+    if (factCount > 0) counts.push(`${factCount} constraint${factCount === 1 ? '' : 's'}`);
+    const parts = [...bits, ...counts];
+    return parts.length ? escapeHtml(parts.join(' · ')) : '<span class="crt_entity_summary_empty">no details yet</span>';
+}
+
+function entityBlockHtml(name, entity, relCount) {
+    const safeName = escapeHtml(name);
+    const isCollapsed = !expandedEntityNames.has(name);
     const identityRows = IDENTITY_FIELDS
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
@@ -738,21 +1401,39 @@ function entityBlockHtml(name, entity) {
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
 
+    const bodyHtml = isCollapsed ? '' : `
+            <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
+            ${bodyDetailSection}
+            <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
+            ${criticalFactsBlockHtml(name, entity)}
+            ${proportionsBlockHtml(entity)}`;
+
     return `
-        <div class="crt_entity_block" data-entity="${safeName}">
+        <div class="crt_entity_block${isCollapsed ? ' crt_collapsed' : ''}" data-entity="${safeName}">
             <div class="crt_entity_header">
-                <strong>${safeName}</strong>
+                <div class="crt_entity_toggle_zone" title="${isCollapsed ? 'Expand' : 'Collapse'}">
+                    <span class="crt_entity_collapse_toggle fa-solid ${isCollapsed ? 'fa-chevron-right' : 'fa-chevron-down'}"></span>
+                    <strong>${safeName}</strong>
+                    ${isCollapsed ? `<span class="crt_entity_summary">${entitySummaryLine(entity, relCount)}</span>` : ''}
+                </div>
                 <label class="checkbox_label">
                     <input type="checkbox" class="crt_include_toggle" data-entity="${safeName}"
                         ${entity.included ? 'checked' : ''} />
                     include in context
                 </label>
                 <button class="menu_button crt_delete_entity" data-entity="${safeName}">Delete</button>
-            </div>
-            <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
-            ${bodyDetailSection}
-            <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
+            </div>${bodyHtml}
         </div>`;
+}
+
+function relationshipCountsByEntity(registry) {
+    const counts = {};
+    for (const rel of registry.relationships) {
+        for (const p of relationshipParticipants(rel)) {
+            counts[p] = (counts[p] || 0) + 1;
+        }
+    }
+    return counts;
 }
 
 function buildEntityListHtml(registry) {
@@ -760,30 +1441,76 @@ function buildEntityListHtml(registry) {
     if (names.length === 0) {
         return '<div class="crt_empty">No characters tracked yet. Send some messages or hit Rescan.</div>';
     }
-    return names.map(name => entityBlockHtml(name, registry.entities[name])).join('');
+    const relCounts = relationshipCountsByEntity(registry);
+    const rows = names.map(name => entityBlockHtml(name, registry.entities[name], relCounts[name] || 0)).join('');
+    const bulkControls = names.length > 1
+        ? `<div class="crt_bulk_collapse_row">
+               <a href="#" class="crt_expand_all_btn">Expand all</a> · <a href="#" class="crt_collapse_all_btn">Collapse all</a>
+           </div>`
+        : '';
+    return bulkControls + rows;
 }
 
 function buildConflictListHtml(registry) {
-    if (registry.pendingConflicts.length === 0) {
-        return '<div class="crt_empty">No pending conflicts on locked fields.</div>';
-    }
-    return registry.pendingConflicts.map(conflictRowHtml).join('');
+    if (registry.pendingConflicts.length === 0) return '';
+    const rows = registry.pendingConflicts.map(conflictRowHtml).join('');
+    return `<h4 class="crt_conflict_heading">⚠ Pending conflicts on locked fields (${registry.pendingConflicts.length})</h4>${rows}`;
 }
 
 function renderEntityList() {
     const registry = getRegistry();
     const active = document.activeElement;
     const isEditingField = active && (
-        active.classList.contains('crt_field_input') || active.classList.contains('crt_add_entity_input')
+        active.classList.contains('crt_field_input') || active.classList.contains('crt_add_entity_input') ||
+        active.classList.contains('crt_add_critical_fact_input')
+    );
+    const isEditingRelationship = active && (
+        active.classList.contains('crt_relationship_label_input') ||
+        active.classList.contains('crt_add_relationship_name1') ||
+        active.classList.contains('crt_add_relationship_name2') ||
+        active.classList.contains('crt_add_relationship_label')
     );
 
     // Don't nuke an input the user is actively typing in — a background
     // auto-extraction pass finishing mid-edit shouldn't wipe their keystrokes.
-    // The conflict list is unrelated DOM, so it's always safe to refresh.
+    // The conflict lists are unrelated DOM, so they're always safe to refresh.
     $('.crt_conflict_list_target').html(buildConflictListHtml(registry));
-    if (isEditingField) return;
+    if (!isEditingField) {
+        $('.crt_entity_list_target').html(buildEntityListHtml(registry));
+    }
 
-    $('.crt_entity_list_target').html(buildEntityListHtml(registry));
+    $('.crt_relationship_conflict_list_target').html(buildRelationshipConflictListHtml(registry));
+    if (!isEditingRelationship) {
+        $('.crt_relationship_list_target').html(buildRelationshipListHtml(registry));
+    }
+    $('.crt_add_relationship_row').each(function () {
+        populateRelationshipNameSelects($(this), registry);
+    });
+
+    const characterCount = Object.keys(registry.entities).length;
+    $('.crt_badge_character_count').text(characterCount ? `(${characterCount})` : '');
+    $('.crt_badge_conflict_flag').text(registry.pendingConflicts.length ? `⚠ ${registry.pendingConflicts.length}` : '')
+        .toggle(registry.pendingConflicts.length > 0);
+
+    $('.crt_badge_relationship_count').text(registry.relationships.length ? `(${registry.relationships.length})` : '');
+    $('.crt_badge_relationship_conflict_flag').text(registry.pendingRelationshipConflicts.length ? `⚠ ${registry.pendingRelationshipConflicts.length}` : '')
+        .toggle(registry.pendingRelationshipConflicts.length > 0);
+
+    renderWorldNotes(registry);
+}
+
+function renderWorldNotes(registry) {
+    const notes = (registry || getRegistry()).worldNotes || { text: '', locked: false };
+    const active = document.activeElement;
+    // Settings-drawer and floating-window textareas are two separate elements
+    // syncing the same underlying value — update each independently, skipping
+    // only the one currently focused so in-progress typing isn't clobbered.
+    $('.crt_world_notes_input').each(function () {
+        if (this === active) return;
+        if ($(this).val() !== notes.text) $(this).val(notes.text);
+        $(this).prop('readonly', !!notes.locked);
+    });
+    $('.crt_world_notes_lock').prop('checked', !!notes.locked);
 }
 
 // ---------------------------------------------------------------------------
@@ -801,9 +1528,19 @@ function bindEntityListEvents() {
         const field = $el.data('field');
         const value = $el.val();
 
-        entity.fields[field] = ARRAY_FIELDS.includes(field)
-            ? value.split(';').map(s => s.trim()).filter(Boolean)
-            : value;
+        if (UNIT_FIELDS[field]) {
+            const normalized = normalizeMeasurement(value, UNIT_FIELDS[field]);
+            if (value.trim() && !normalized) {
+                setStatus(`"${field}" needs a number (e.g. 175) — not saved.`, 'error');
+                $el.val(extractNumber(entity.fields[field]) ?? '');
+                return;
+            }
+            entity.fields[field] = normalized ?? '';
+        } else if (ARRAY_FIELDS.includes(field)) {
+            entity.fields[field] = value.split(';').map(s => s.trim()).filter(Boolean);
+        } else {
+            entity.fields[field] = value;
+        }
 
         saveRegistry(registry);
         updateInjection();
@@ -834,9 +1571,68 @@ function bindEntityListEvents() {
         const name = $(this).data('entity');
         const registry = getRegistry();
         delete registry.entities[name];
+        expandedEntityNames.delete(name);
         saveRegistry(registry);
         updateInjection();
         renderEntityList();
+    });
+
+    $doc.on('click', '.crt_add_critical_fact_btn', function () {
+        const name = $(this).data('entity');
+        const $input = $(this).siblings('.crt_add_critical_fact_input');
+        const text = $input.val().trim();
+        if (!text) return;
+
+        const registry = getRegistry();
+        const entity = ensureEntity(registry, name);
+        entity.criticalFacts.push(text);
+        saveRegistry(registry);
+        updateInjection();
+        renderEntityList();
+    });
+    $doc.on('keydown', '.crt_add_critical_fact_input', function (e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            $(this).trigger('blur'); // blur first — a synthetic click below doesn't blur it on its own
+            $(this).siblings('.crt_add_critical_fact_btn').trigger('click');
+        }
+    });
+
+    $doc.on('click', '.crt_critical_fact_delete', function () {
+        const name = $(this).data('entity');
+        const index = $(this).data('index');
+        const registry = getRegistry();
+        const entity = ensureEntity(registry, name);
+        entity.criticalFacts.splice(index, 1);
+        saveRegistry(registry);
+        updateInjection();
+        renderEntityList();
+    });
+
+    $doc.on('click', '.crt_entity_toggle_zone', function () {
+        const name = $(this).closest('.crt_entity_block').data('entity');
+        if (expandedEntityNames.has(name)) {
+            expandedEntityNames.delete(name);
+        } else {
+            expandedEntityNames.add(name);
+        }
+        renderEntityList();
+    });
+
+    $doc.on('click', '.crt_expand_all_btn', function (e) {
+        e.preventDefault();
+        const registry = getRegistry();
+        Object.keys(registry.entities).forEach(n => expandedEntityNames.add(n));
+        renderEntityList();
+    });
+    $doc.on('click', '.crt_collapse_all_btn', function (e) {
+        e.preventDefault();
+        expandedEntityNames.clear();
+        renderEntityList();
+    });
+
+    $doc.on('click', '.crt_section_header', function () {
+        $(this).closest('.crt_section').toggleClass('crt_section_open');
     });
 
     $doc.on('click', '.crt_conflict_accept', function () {
@@ -850,6 +1646,11 @@ function bindEntityListEvents() {
         runExtraction(true);
     });
 
+    $doc.on('click', '.crt_export_json_link', function (e) {
+        e.preventDefault();
+        exportHeightChart();
+    });
+
     $doc.on('click', '.crt_add_entity_btn', function () {
         const $input = $(this).siblings('.crt_add_entity_input');
         addEntityManually($input.val());
@@ -859,8 +1660,83 @@ function bindEntityListEvents() {
         if (e.key === 'Enter') {
             e.preventDefault();
             addEntityManually($(this).val());
-            $(this).val('');
+            $(this).val('').trigger('blur'); // blur so the guard below doesn't suppress the refresh that shows it
         }
+    });
+
+    $doc.on('change', '.crt_world_notes_input', function () {
+        const registry = getRegistry();
+        if (!registry.worldNotes) registry.worldNotes = { text: '', locked: false };
+        if (registry.worldNotes.locked) {
+            // Shouldn't normally fire (readonly blocks typing) — guard anyway
+            // and re-sync in case it somehow did.
+            renderWorldNotes(registry);
+            return;
+        }
+        registry.worldNotes.text = $(this).val();
+        saveRegistry(registry);
+        updateInjection();
+    });
+
+    $doc.on('change', '.crt_world_notes_lock', function () {
+        const registry = getRegistry();
+        if (!registry.worldNotes) registry.worldNotes = { text: '', locked: false };
+        registry.worldNotes.locked = $(this).is(':checked');
+        saveRegistry(registry);
+        renderWorldNotes(registry);
+    });
+
+    $doc.on('change', '.crt_relationship_lock', function () {
+        const id = $(this).data('id');
+        const registry = getRegistry();
+        const rel = registry.relationships.find(r => r.id === id);
+        if (rel) rel.locked = $(this).is(':checked');
+        saveRegistry(registry);
+    });
+
+    $doc.on('click', '.crt_relationship_delete', function () {
+        const id = $(this).data('id');
+        const registry = getRegistry();
+        registry.relationships = registry.relationships.filter(r => r.id !== id);
+        saveRegistry(registry);
+        updateInjection();
+        renderEntityList();
+    });
+
+    $doc.on('change', '.crt_relationship_label_input', function () {
+        const id = $(this).data('id');
+        const registry = getRegistry();
+        const rel = registry.relationships.find(r => r.id === id);
+        if (rel) rel.label = $(this).val();
+        saveRegistry(registry);
+        updateInjection();
+        renderEntityList();
+    });
+
+    $doc.on('change', '.crt_add_relationship_type', function () {
+        const $row = $(this).closest('.crt_add_relationship_row');
+        populateRelationshipNameSelects($row, getRegistry());
+        $row.find('.crt_add_relationship_label').toggle($(this).val() === 'other');
+    });
+
+    $doc.on('click', '.crt_add_relationship_btn', function () {
+        const $row = $(this).closest('.crt_add_relationship_row');
+        const added = addRelationshipManually(
+            $row.find('.crt_add_relationship_type').val(),
+            $row.find('.crt_add_relationship_name1').val(),
+            $row.find('.crt_add_relationship_name2').val(),
+            $row.find('.crt_add_relationship_label').val(),
+        );
+        if (added) {
+            $row.find('.crt_add_relationship_name1, .crt_add_relationship_name2, .crt_add_relationship_label').val('');
+        }
+    });
+
+    $doc.on('click', '.crt_relationship_conflict_accept', function () {
+        resolveRelationshipConflict($(this).data('id'), true);
+    });
+    $doc.on('click', '.crt_relationship_conflict_reject', function () {
+        resolveRelationshipConflict($(this).data('id'), false);
     });
 
     // Settings-drawer-only controls (unique ids, so no delegation collision risk)
@@ -879,6 +1755,10 @@ function bindEntityListEvents() {
     });
     $doc.on('change', '#crt_injection_depth', function () {
         getSettings().injectionDepth = Number($(this).val()) || defaultSettings.injectionDepth;
+        updateInjection();
+    });
+    $doc.on('change', '#crt_critical_facts_depth', function () {
+        getSettings().criticalFactsDepth = Number($(this).val()) || defaultSettings.criticalFactsDepth;
         updateInjection();
     });
     $doc.on('change', '#crt_fallback_response_length', function () {
@@ -919,6 +1799,83 @@ function addEntityManually(rawName) {
     setStatus(`Added "${name}" manually. Fill in fields below, or wait for the next extraction pass to fill in what it can.`, 'ok');
 }
 
+// Manual entry always wins outright — locks only guard against extraction's
+// own (fallible) guesses, never against something you typed in yourself.
+function upsertRelationshipManually(registry, rel) {
+    const key = relationshipKey(rel);
+    const idx = registry.relationships.findIndex(r => relationshipKey(r) === key);
+    if (idx === -1) {
+        registry.relationships.push({ id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, ...rel, locked: false });
+    } else {
+        registry.relationships[idx] = { ...registry.relationships[idx], ...rel };
+    }
+}
+
+function addRelationshipManually(type, rawName1, rawName2, rawLabel) {
+    const registry = getRegistry();
+
+    if (!RELATIONSHIP_TYPES.includes(type)) {
+        setStatus('Pick a relationship type first.', 'error');
+        return false;
+    }
+    if (!String(rawName1 || '').trim() || !String(rawName2 || '').trim()) {
+        setStatus('Both names are needed to add a relationship.', 'error');
+        return false;
+    }
+
+    const name1 = resolveEntityName(registry, rawName1);
+    const name2 = resolveEntityName(registry, rawName2);
+    if (!name1 || !name2) {
+        const missing = [!name1 ? `"${rawName1}"` : null, !name2 ? `"${rawName2}"` : null].filter(Boolean).join(' and ');
+        setStatus(`${missing} not found among tracked characters — check spelling, or add them above first.`, 'error');
+        return false;
+    }
+    if (name1 === name2) {
+        setStatus('A character can\'t have a relationship with themselves.', 'error');
+        return false;
+    }
+
+    const rel = type === 'parent_child'
+        ? { type, parent: name1, child: name2 }
+        : type === 'other'
+            ? { type, a: name1, b: name2, label: String(rawLabel || '').trim() || 'connected to' }
+            : { type, a: name1, b: name2 };
+
+    upsertRelationshipManually(registry, rel);
+    saveRegistry(registry);
+    updateInjection();
+    renderEntityList();
+    setStatus(`Added: ${relationshipSentence(rel)}`, 'ok');
+    return true;
+}
+
+function resolveRelationshipConflict(id, accept) {
+    const registry = getRegistry();
+    const idx = registry.pendingRelationshipConflicts.findIndex(c => c.id === id);
+    if (idx === -1) return;
+
+    const conflict = registry.pendingRelationshipConflicts[idx];
+    if (accept) {
+        if (conflict.isNewContradictingEdge) {
+            // The old locked edge was wrong — replace it with the proposed one.
+            registry.relationships = registry.relationships.filter(r => r.id !== conflict.relationshipId);
+            registry.relationships.push({
+                id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                ...conflict.proposedEdge,
+                locked: false,
+            });
+        } else {
+            const rel = registry.relationships.find(r => r.id === conflict.relationshipId);
+            if (rel) rel.label = conflict.newLabel;
+        }
+    }
+
+    registry.pendingRelationshipConflicts.splice(idx, 1);
+    saveRegistry(registry);
+    updateInjection();
+    renderEntityList();
+}
+
 function resolveConflict(id, accept) {
     const registry = getRegistry();
     const idx = registry.pendingConflicts.findIndex(c => c.id === id);
@@ -938,16 +1895,71 @@ function resolveConflict(id, accept) {
 // UI — settings-drawer panel
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// UI — collapsible section shell used for every major block in both panels.
+// Purely CSS-class-driven (crt_section_open) rather than JS-tracked state:
+// these wrapper elements are only ever built once at mount (unlike per-
+// character blocks, which get fully rebuilt on every render), so a toggled
+// class here survives every subsequent renderEntityList() call for free.
+// ---------------------------------------------------------------------------
+function sectionHtml(title, bodyHtml, { startOpen = false, badgeHtml = '' } = {}) {
+    return `
+        <div class="crt_section${startOpen ? ' crt_section_open' : ''}">
+            <div class="crt_section_header">
+                <span class="crt_section_chevron fa-solid fa-chevron-right"></span>
+                <span class="crt_section_title">${title}</span>
+                ${badgeHtml}
+            </div>
+            <div class="crt_section_body">
+                ${bodyHtml}
+            </div>
+        </div>`;
+}
+
+function worldNotesBodyHtml() {
+    return `
+                <p class="crt_hint">Freeform — nothing here is ever touched by extraction. Write it yourself, lock it to prevent accidental edits, unlock to update when something important changes. Injected at the highest-priority position (alongside the scenario), not the rolling chat depth used for tracked characters.</p>
+                <textarea class="text_pole crt_world_notes_input" rows="4" placeholder="e.g. Setting: Ancient Greece, 430 BCE. City: Athens."></textarea>
+                <label class="checkbox_label crt_world_notes_lock_label">
+                    <input type="checkbox" class="crt_world_notes_lock" />
+                    Lock (prevent edits)
+                </label>`;
+}
+
+function relationshipsBodyHtml() {
+    const typeOptionsHtml = RELATIONSHIP_TYPES
+        .map(t => `<option value="${t}">${escapeHtml(RELATIONSHIP_TYPE_LABELS[t])}</option>`)
+        .join('');
+    return `
+                <p class="crt_hint">How tracked characters relate to EACH OTHER — not to {{user}} (that's still each character's own "relationship_to_user" field). One shared entry per relationship rather than a copy on each side, so there's nothing for two cards to contradict. Lock a relationship to protect it — a later proposal that disagrees (a changed label, or a new, contradicting parent/spouse) is queued below instead of applied silently.</p>
+                <div class="crt_relationship_conflict_list_target"></div>
+                <div class="crt_relationship_list_target"></div>
+                <div class="crt_add_relationship_row">
+                    <select class="text_pole crt_add_relationship_type">${typeOptionsHtml}</select>
+                    <select class="text_pole crt_add_relationship_name1"></select>
+                    <select class="text_pole crt_add_relationship_name2"></select>
+                    <input type="text" class="text_pole crt_add_relationship_label" placeholder="Label (e.g. mentor of)" />
+                    <button class="menu_button crt_add_relationship_btn">Add relationship</button>
+                </div>`;
+}
+
+function trackedCharactersBodyHtml() {
+    return `
+                <div class="crt_add_entity_row">
+                    <input type="text" class="text_pole crt_add_entity_input" placeholder="Character name (if a scan missed them)" />
+                    <button class="menu_button crt_add_entity_btn">Add character</button>
+                </div>
+                <a href="#" class="crt_export_json_link">Data-only JSON</a>
+                <div class="crt_conflict_list_target"></div>
+                <div class="crt_entity_list_target"></div>`;
+}
+
+const RELATIONSHIP_BADGE_HTML = '<span class="crt_badge crt_badge_relationship_count"></span><span class="crt_badge crt_badge_warn crt_badge_relationship_conflict_flag"></span>';
+const CHARACTERS_BADGE_HTML = '<span class="crt_badge crt_badge_character_count"></span><span class="crt_badge crt_badge_warn crt_badge_conflict_flag"></span>';
+
 function settingsPanelHtml() {
     const settings = getSettings();
-    return `
-    <div id="crt_panel">
-        <div class="inline-drawer">
-            <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Character Registry Tracker</b>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-            </div>
-            <div class="inline-drawer-content">
+    const settingsBody = `
                 <label class="checkbox_label">
                     <input type="checkbox" id="crt_enabled" ${settings.enabled ? 'checked' : ''} />
                     Enabled (inject registry into context)
@@ -969,6 +1981,10 @@ function settingsPanelHtml() {
                     <input type="number" id="crt_injection_depth" class="text_pole" min="0" value="${settings.injectionDepth}" />
                 </div>
                 <div class="crt_setting_row">
+                    <label for="crt_critical_facts_depth" title="Deliberately closer than the main injection depth above — see README">Critical constraints depth</label>
+                    <input type="number" id="crt_critical_facts_depth" class="text_pole" min="0" value="${settings.criticalFactsDepth}" />
+                </div>
+                <div class="crt_setting_row">
                     <label for="crt_fallback_response_length">Extraction response length (tokens, non-grammar path)</label>
                     <input type="number" id="crt_fallback_response_length" class="text_pole" min="128" value="${settings.fallbackResponseLength}" />
                 </div>
@@ -987,20 +2003,23 @@ function settingsPanelHtml() {
                 <div class="crt_setting_row">
                     <label for="crt_kobold_max_length">Max response length (tokens)</label>
                     <input type="number" id="crt_kobold_max_length" class="text_pole" min="64" value="${settings.koboldMaxLength}" />
-                </div>
+                </div>`;
 
+    return `
+    <div id="crt_panel">
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>Character Registry Tracker</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
                 <button class="menu_button crt_rescan_btn">Rescan now</button>
                 <div class="crt_status crt_status_target"></div>
 
-                <h4>Tracked characters</h4>
-                <div class="crt_add_entity_row">
-                    <input type="text" class="text_pole crt_add_entity_input" placeholder="Character name (if a scan missed them)" />
-                    <button class="menu_button crt_add_entity_btn">Add character</button>
-                </div>
-                <div class="crt_entity_list_target"></div>
-
-                <h4>Pending conflicts on locked fields</h4>
-                <div class="crt_conflict_list_target"></div>
+                ${sectionHtml('Tracked characters', trackedCharactersBodyHtml(), { startOpen: true, badgeHtml: CHARACTERS_BADGE_HTML })}
+                ${sectionHtml('Relationships', relationshipsBodyHtml(), { startOpen: false, badgeHtml: RELATIONSHIP_BADGE_HTML })}
+                ${sectionHtml('World notes', worldNotesBodyHtml(), { startOpen: true })}
+                ${sectionHtml('Settings &amp; connection', settingsBody, { startOpen: false })}
             </div>
         </div>
     </div>`;
@@ -1020,13 +2039,10 @@ function floatingPanelHtml() {
         <div id="crt_floating_body">
             <button class="menu_button crt_rescan_btn">Rescan now</button>
             <div class="crt_status crt_status_target"></div>
-            <div class="crt_add_entity_row">
-                <input type="text" class="text_pole crt_add_entity_input" placeholder="Character name (if a scan missed them)" />
-                <button class="menu_button crt_add_entity_btn">Add character</button>
-            </div>
-            <div class="crt_entity_list_target"></div>
-            <h4>Pending conflicts on locked fields</h4>
-            <div class="crt_conflict_list_target"></div>
+
+            ${sectionHtml('Tracked characters', trackedCharactersBodyHtml(), { startOpen: true, badgeHtml: CHARACTERS_BADGE_HTML })}
+            ${sectionHtml('Relationships', relationshipsBodyHtml(), { startOpen: false, badgeHtml: RELATIONSHIP_BADGE_HTML })}
+            ${sectionHtml('World notes', worldNotesBodyHtml(), { startOpen: true })}
         </div>
     </div>`;
 }

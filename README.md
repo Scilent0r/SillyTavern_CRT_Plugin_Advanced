@@ -126,8 +126,232 @@ and the merge logic enforces the same rule server-side even if a model
 ignores the prompt, so stored data can't drift out of sync with what's ever
 shown or injected.
 
+**Units are enforced on height, weight, bust, waist, hip.** These are
+always stored and injected as `<number>cm` or `<number>kg` — the input box
+only takes the number, the unit is a fixed suffix you can't edit. Typing
+something with no number in it (or leaving it blank) doesn't get saved; a
+brief error shows and the field reverts. The extraction prompt tells the
+model to convert imperial units and return a plain number — but the
+normalizer itself just extracts the first number it finds, it doesn't do
+unit conversion. Type the number in cm/kg directly (e.g. "70" for weight,
+not "154 lbs") — typing an imperial value will silently produce a wrong
+number rather than converting it.
+
 **Story state** (relationship_to_user, weight, status, key_facts) — the
 parts of a character expected to actually change over the story.
+
+## Body-proportion guidelines (auto, female + over 200cm)
+
+For female characters taller than 200cm, four extra read-only sections
+appear: **Height of key points** (ankle, knee, crotch, hip, breast, neck,
+chin — each measured from the ground up), **Arms and legs** (arm length,
+leg length, palm width, middle finger length, ring finger thickness),
+**Movement** (walking/running stride length and speed in km/h), and **Feet**
+(length, width, assumed EU shoe size). All four are computed live from the
+`height` field alone — nothing here is stored, locked, or sent through
+extraction, so it can never drift out of sync with height and there's no
+extra data to maintain.
+
+Key points, arms/legs, and movement all come from the same source: the
+classic "head-heights" body-scaling method (the same math behind the
+well-known GTS Converter tool). Every value is some fixed multiple of a
+reference head-height, which itself is a fixed fraction of total height.
+Reduced algebraically down to a single known target height, the reference
+baseline cancels out completely and every value becomes a pure ratio of
+total height — e.g. crotch height is exactly half of total height, arm
+length is exactly `22/68` of total height, running speed is derived from
+running stride at an assumed 9600 steps/hour, and so on. That's what's
+hardcoded for those three sections.
+
+**Feet work the other way round and use different math.** The source tool
+takes shoe size as an independent input and scales it — it never derives a
+shoe size *from* height, so there's no ratio to reduce the way there was for
+everything else. Foot length/width/EU size instead use standard real-world
+shoe-fitting approximations: foot length ≈ 15% of height, width ≈ 39% of
+foot length, EU size ≈ foot length (cm) × 1.5 + 2. These aren't from the
+uploaded calculator and are a genuine approximation rather than a derived
+identity — sanity-checked against a normal 170cm height (25.5cm foot → EU
+40, matching real shoe charts almost exactly), but treat scaled-up giant
+values as illustrative rather than exact.
+
+One other simplification: **breast height** omits the source tool's bra-cup
+correction term, which needs a cup letter we don't track as a field — it
+uses the plain ratio (`5/7` of height) instead.
+
+The 200cm/female trigger is hardcoded (not a setting) per how this was
+scoped — ask if you want it configurable.
+
+## Layout: collapsible sections, built for large rosters
+
+The whole panel (both the settings drawer and the floating window) is
+organized into collapsible sections — **Tracked characters**, **Relationships**,
+**World notes**, and (settings drawer only) **Settings & connection** —
+each with a live count badge in its header so you can gauge how much is in
+there without opening it, and a red "⚠ N" badge that appears next to that
+count whenever something in it needs a decision (a pending conflict). That
+badge stays visible even while the section is collapsed, specifically so a
+conflict can never go unnoticed just because you had that section closed.
+
+- **Characters start collapsed.** Every character card loads collapsed to
+  just its header — name, an inline summary (sex/age/height plus relationship
+  and constraint counts, whichever apply), the include-in-context toggle,
+  and delete. Click anywhere on the name/chevron area to expand a single
+  one. "Expand all" / "Collapse all" links sit above the list once you have
+  more than one character, for scanning or tidying the whole roster at
+  once. This is a pure display preference, not data — it isn't saved to the
+  chat and resets to all-collapsed on reload.
+- **Relationships default collapsed too**, behind their own section — in a
+  long campaign the relationship graph can get a lot longer than any single
+  character's card, so it's not force-expanded on load the way it used to
+  be. The header's `(N)` badge tells you the total count at a glance.
+- **Pending conflicts (of either kind) are never shown as empty filler.**
+  The "Pending conflicts" heading and list only appear at all once there's
+  something in them — otherwise that space just isn't there. Their live
+  counts show as the warning badge described above.
+
+## World notes
+
+A freeform text box sits inside its own section in both the settings
+drawer and the floating window — for manually maintained facts about the
+world itself rather than any character: setting, era, the name of the place
+you're in, anything that should stay true regardless of who's currently in
+scene. It's completely separate from the character registry: extraction
+never reads it, never writes it, never touches it in any way. You write it,
+you update it, you decide when it changes.
+
+**Lock** makes the box read-only (a plain accidental-edit guard, not a
+conflict-review mechanism like the per-field character locks — there's
+nothing to protect it from since nothing auto-updates it). Uncheck to edit,
+recheck when you're done.
+
+**Injected separately from the character registry, at a different, higher-
+priority position.** Tracked characters are injected at a rolling chat
+depth (see "Injection positioning" above) because recency matters for
+facts that need to compete with a lot of scrolling narrative. World notes
+use `IN_PROMPT` instead — anchored next to the scenario/description in the
+assembled prompt rather than scrolling through chat history, so it stays
+present with the same weight as core setting information regardless of how
+long the chat gets. It's independent of the "Enabled" toggle too, since
+that toggle only governs the auto-extracted character registry — world
+notes keep injecting even if you've paused that.
+
+## Exporting to the Height Comparison chart
+
+The **"Data-only JSON"** link (settings drawer or floating window, above
+the character list) downloads `height-comparison.json` — every tracked
+character with a height set, plus an auto-assigned display color. Open the
+Height Comparison page and use its own "Import JSON" button. Characters
+with no height yet are skipped.
+
+Stencil is picked automatically from `sex`, no manual choice involved: male
+always exports as `figure-male`; female gets a random pick each export from
+`figure-pose` / `figure-back` / `figure` (varies between exports on
+purpose); unset sex falls back to a plain `figure`.
+
+## Critical constraints
+
+**The problem this solves:** a fact can be correctly stored and correctly
+injected and still get ignored — e.g. a 50m-tall character still gets
+written sleeping in a normal bed or walking through halls, even with the
+height tracked accurately and a manual `key_facts` note saying he's too big
+for that. That's not a storage bug — the data's there. It's a **salience**
+problem: a single passively-worded line sitting among a dozen other facts
+in the character blurb doesn't compete well against the model's strong
+default narrative habits, especially for a smaller/finetuned model.
+
+**Three things about this field are different from every other field on
+purpose, each targeting one part of that problem:**
+
+- **Manual-only, never touched by extraction** (same philosophy as World
+  Notes) — so it can't get reworded, diluted, or dropped across passes the
+  way `key_facts` can. You write the constraint once, in your own words.
+- **Auto-wrapped in explicit, imperative framing at injection time** —
+  whatever short phrase you write gets rendered as `MUST NOT be
+  contradicted — <Name>: <your text>.`, not stated as a passive fact. You
+  don't have to prompt-engineer the phrasing yourself each time.
+- **Injected at its own depth, deliberately closer than the character
+  registry's own depth** — a separate "Critical constraints depth" setting
+  (default 0, the closest possible position) versus the main registry's
+  default of 1. The character registry's depth was chosen for facts that
+  need to survive being buried by chat length; this is for facts that need
+  to win the very next sentence specifically, which is a recency problem
+  more than a survival problem, and recency is what depth 0 maximizes.
+
+**Where to find it:** a new "Critical constraints" group in each
+character's card, styled distinctly (amber border) so it doesn't blend in
+with the ordinary fields around it. Add short, concrete entries — "cannot
+fit inside buildings, doorways, or furniture" reads better to a model than
+restating the raw height and expecting it to derive the implication itself.
+Spelling out the *consequence*, not just the fact, is doing real work here.
+
+**This won't guarantee compliance** — no prompt-engineering technique does,
+especially against a small model's strong learned priors. It stacks the
+deck as far as data modeling and injection design can: distinct framing,
+protected from dilution, positioned for maximum next-token influence. If a
+specific constraint still gets violated often, the next lever to pull is
+usually the model itself (a larger model, or a finetune that's actually
+seen "must never" style constraints honored during training) rather than
+anything else this extension can do structurally.
+
+## Relationships between characters
+
+**The problem this solves:** `relationship_to_user` works reliably because
+there's only ever one other party — the user — so a single string per
+character never contradicts itself. A relationship *between two tracked
+characters* has no such guarantee. Before this, the only place for that kind
+of fact was `key_facts`, a free-text array that gets wholesale-replaced
+(not merged) on every extraction pass — so "Halfrun's child: Runa" on one
+card and "Runa's parent: Halfrun" on another could silently drift apart
+across passes, or get dropped and reworded differently each time. That's
+the actual mechanism behind parents and children getting mixed up, not
+carelessness on the model's part — the data model just had nowhere reliable
+to put the fact.
+
+**The fix: one shared fact per relationship, not two copies.** Relationships
+live in their own collapsible section, separate from every character's own
+fields. Each relationship is stored exactly once — both directions ("Halfrun is
+Runa's parent" / "Runa is Halfrun's child") are generated from that single
+record when injected, so there is nothing for two sides to disagree about,
+because there's only one side.
+
+**A small, fixed vocabulary, deliberately — this is the part aimed at
+smaller/finetuned models.** Every relationship has a `type`: `parent_child`,
+`spouse`, `sibling`, or `other` (with a short freeform label, for anything
+else — mentor, rival, employer, friend). `parent_child` uses explicit
+`parent`/`child` role names rather than a generic, order-dependent pair —
+a model doesn't have to be trusted to consistently pick which side goes
+first, the field name itself carries the meaning. A bounded, named choice
+like this is far more reliable for a model to emit correctly and for the
+extension to parse and act on than open-ended prose ever could be, and it's
+also easier for a small/finetuned model reading the injected text to latch
+onto, since the same handful of sentence shapes recur verbatim rather than
+being reworded freely each time.
+
+**Locking now protects against a NEW, contradicting fact too, not just an
+edited one.** For `parent_child` and `spouse` specifically — the two types
+where a second, different answer is usually a sign something got mixed up
+rather than a normal multiplicity — locking a relationship also blocks a
+*different*, newly-proposed edge from silently sneaking in alongside it
+(e.g. a second "parent" appearing for the same child from a later
+extraction pass). That kind of contradiction goes to a dedicated "Pending
+relationship conflicts" queue instead, exactly like a locked field
+conflict, where you can accept the correction (replacing the old edge) or
+reject it (keep what was there). `sibling` and `other` aren't restricted
+this way, since having several is normal for those rather than a sign of
+an error.
+
+**Manual add**: a form below the relationship list, with two dropdowns
+(populated from currently tracked characters — no typing a name, so no way
+to mistype or mis-case one) that relabel their placeholder to
+"Parent"/"Child" when you pick that type. Manual entry always wins
+outright, the same way typing directly into a character's field does —
+locks only guard against extraction's own guesses, never against something
+you picked yourself.
+
+**Injected as its own block, right after the Character Registry block, at
+the same position and depth.** Relationships involving a character whose
+"include in context" is unchecked are left out, matching how that toggle
+already works for character data.
 
 ## Manual add & error codes
 
