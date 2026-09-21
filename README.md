@@ -1,6 +1,16 @@
 # Character Registry Tracker (CCT v2)
 
-Basically a plugin for SillyTavern that does automatic tracking and priorizing on multiple characters and their relationships with eachother. Excellent for longer playthrougs with multiple characters. Works well in conjunction with memorybooks. 
+Solves the "SillyTavern forgets Halfrun is a she after a reboot" problem.
+Chat logs survive reboots fine — what's lost is anything that only lived in
+the model's context window. This extension keeps a small, structured,
+auto-updated fact registry per character, stored in the chat's own metadata
+(so it's on disk, not in-context), and injects it into every generation at a
+fixed depth — the same mechanism Author's Note uses — so it can't fall out of
+context the way a stray line from message #340 can.
+
+Separate from Character Card Tracker (v1). v1 does manual per-character stat
+entry for group-chat display; this does automatic fact extraction for
+long-term continuity. They can run side by side.
 
 ## Install
 
@@ -99,37 +109,68 @@ matches how the SillyTavern community already writes this kind of always-on
 injected fact (e.g. `[Genre; Tags; Scenario]`), which reads as "world fact"
 rather than "text to imitate."
 
+## Model-specific tuning
+
+The schema and extraction prompt were trimmed for reliability with
+creative-writing-oriented local models — concretely tuned against
+[TheDrummer/Artemis-31B-v1.1](https://huggingface.co/TheDrummer/Artemis-31B-v1.1),
+a Gemma-4 finetune whose own model card states it deprioritizes
+"intelligence, correctness, problem solving" in favor of creativity,
+writing quality, and dynamism — and explicitly lists inventing novel
+formats as a *desirable* trait. Two consequences drove this pass:
+
+- **Grammar mode matters more than usual here, not less.** A model tuned to
+  sometimes deviate from rigid structure in service of prose is exactly the
+  case where you want the deviation to be structurally impossible rather
+  than discouraged. If you're running a model in this family, turning on
+  the KoboldCPP grammar-mode URL (see below) is the single highest-leverage
+  reliability setting available — it constrains what tokens can be sampled
+  at all, rather than relying on the model's willingness to comply with the
+  extraction prompt's rules.
+- **Dense numeric/structured content in the injected context is worse than
+  usual for this kind of model.** A creativity-tuned model is more likely
+  to find a stat block jarring against its own trained prose style than a
+  general-purpose instruct model would be. That's the direct reasoning
+  behind removing body detail and the body-proportion/movement/feet block
+  (see the note under "Fields tracked" below) — both were the densest,
+  least narratively-relevant content any character's block could carry.
+- **Fewer simultaneous extraction rules, for the same reason "fewer fields"
+  helps.** The extraction prompt dropped from 6 to 5 rules for `updates` by
+  removing the bust/waist/hip carve-out — one less rule for a model that's
+  not optimized for rule-precision to have to hold and correctly apply.
+
+None of this is specific to Artemis by name — it generalizes to any
+similarly creativity-first finetune. If you switch to a more
+correctness-oriented model later, none of this hurts; it's just not the
+tuning direction that model would need.
+
 ## Fields tracked
 
 **Identity** (name, sex, age, pronouns, species, height, physique) — shown
 for every character. "sex" is a fixed two-option dropdown (male/female,
-plus unset) rather than free text, since body-detail visibility keys off it
-exactly.
+plus unset); also drives the automatic stencil choice on export (see
+"Exporting to the Height Comparison chart").
 
-**Body detail** (bust, waist, hip) — three separate lockable fields, not one
-blob string, so you can lock waist without locking bust. Visibility is fully
-automatic and tied to "sex": the section only appears once sex is set to
-female, and disappears again if it's changed away from female. There's no
-manual override — the extraction prompt is instructed to only propose these
-three fields for characters whose sex is female and never invent numbers,
-and the merge logic enforces the same rule server-side even if a model
-ignores the prompt, so stored data can't drift out of sync with what's ever
-shown or injected.
-
-**Units are enforced on height, weight, bust, waist, hip.** These are
-always stored and injected as `<number>cm` or `<number>kg` — the input box
-only takes the number, the unit is a fixed suffix you can't edit. Typing
-something with no number in it (or leaving it blank) doesn't get saved; a
-brief error shows and the field reverts. The extraction prompt tells the
-model to convert imperial units and return a plain number — but the
-normalizer itself just extracts the first number it finds, it doesn't do
-unit conversion. Type the number in cm/kg directly (e.g. "70" for weight,
-not "154 lbs") — typing an imperial value will silently produce a wrong
-number rather than converting it.
+**Units are enforced on height and weight.** Both are always stored and
+injected as `<number>cm` or `<number>kg` — the input box only takes the
+number, the unit is a fixed suffix you can't edit. Typing something with no
+number in it (or leaving it blank) doesn't get saved; a brief error shows
+and the field reverts. The extraction prompt tells the model to convert
+imperial units and return a plain number — but the normalizer itself just
+extracts the first number it finds, it doesn't do unit conversion. Type the
+number in cm/kg directly (e.g. "70" for weight, not "154 lbs") — typing an
+imperial value will silently produce a wrong number rather than converting
+it.
 
 **Story state** (relationship_to_user, weight, status, key_facts) — the
 parts of a character expected to actually change over the story.
 
+> Removed as of the latest pass (see "Model-specific tuning" below): body
+> detail (bust/waist/hip) and the auto-computed body-proportion/movement/feet
+> guidelines. Both added real injected-token density for information that
+> mattered more for literal physical precision than for narrative steering —
+> not a good trade for a creative-writing-oriented model. height and weight
+> were kept; they're cheap (one number each) and still narratively useful.
 
 ## Layout: collapsible sections, built for large rosters
 
@@ -184,6 +225,19 @@ present with the same weight as core setting information regardless of how
 long the chat gets. It's independent of the "Enabled" toggle too, since
 that toggle only governs the auto-extracted character registry — world
 notes keep injecting even if you've paused that.
+
+## Exporting to the Height Comparison chart
+
+The **"Data-only JSON"** link (settings drawer or floating window, above
+the character list) downloads `height-comparison.json` — every tracked
+character with a height set, plus an auto-assigned display color. Open the
+Height Comparison page and use its own "Import JSON" button. Characters
+with no height yet are skipped.
+
+Stencil is picked automatically from `sex`, no manual choice involved: male
+always exports as `figure-male`; female gets a random pick each export from
+`figure-pose` / `figure-back` / `figure` (varies between exports on
+purpose); unset sex falls back to a plain `figure`.
 
 ## Critical constraints
 

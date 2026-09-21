@@ -26,12 +26,10 @@ const CRITICAL_FACTS_PROMPT_KEY = 'CRT_CRITICAL_FACTS_BLOCK';
 // data, so it doesn't need to survive a page reload the way locks/fields do.
 const expandedEntityNames = new Set();
 
-// Purely cosmetic grouping for the UI — behaves identically either way,
-// except BODY_DETAIL_FIELDS are conditionally hidden (see shouldShowBodyDetail).
+// Purely cosmetic grouping for the UI.
 const IDENTITY_FIELDS = ['name', 'sex', 'age', 'pronouns', 'species', 'height', 'physique'];
-const BODY_DETAIL_FIELDS = ['bust', 'waist', 'hip'];
 const STATE_FIELDS = ['relationship_to_user', 'weight', 'status', 'key_facts'];
-const ALL_FIELDS = [...IDENTITY_FIELDS, ...BODY_DETAIL_FIELDS, ...STATE_FIELDS];
+const ALL_FIELDS = [...IDENTITY_FIELDS, ...STATE_FIELDS];
 const ARRAY_FIELDS = ['key_facts'];
 const SEX_OPTIONS = ['', 'male', 'female']; // '' = unset
 
@@ -107,7 +105,7 @@ function relationshipSentence(rel) {
 
 // Fields stored/displayed as "<number><unit>" — the number is validated and
 // the unit is always appended by the extension itself, never typed by hand.
-const UNIT_FIELDS = { height: 'cm', weight: 'kg', bust: 'cm', waist: 'cm', hip: 'cm' };
+const UNIT_FIELDS = { height: 'cm', weight: 'kg' };
 
 // Extracts the leading non-negative number from a value, or null if none.
 function extractNumber(rawValue) {
@@ -121,128 +119,6 @@ function extractNumber(rawValue) {
 function normalizeMeasurement(rawValue, unit) {
     const num = extractNumber(rawValue);
     return num ? `${num}${unit}` : null;
-}
-
-// ---------------------------------------------------------------------------
-// Body-proportion guidelines (auto, female + height > 200cm)
-//
-// Derived from the classic "head-heights" scaling method used by the GTS
-// Converter tool: every body-point height and limb length is expressed as a
-// ratio of a baseline height, scaled by (targetHeight / baselineHeight). When
-// you reduce that algebraically for a single known target height (rather
-// than scaling from a separate reference photo, which the original tool was
-// built for), the baseline cancels out completely — every value collapses to
-// a fixed ratio of total height. That's what's hardcoded below.
-//
-// Read-only and never stored: always recomputed live from the "height"
-// field, never sent through extraction, never lockable. Two source fields
-// (foot width/length) are omitted — the original tool derives those from an
-// independent shoe-size input we don't track, so they can't be reduced to a
-// pure height ratio the same way.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Body-proportion guidelines (auto, female + height > 200cm)
-//
-// Derived from the classic "head-heights" scaling method used by the GTS
-// Converter tool: every body-point height and limb length is expressed as a
-// ratio of a baseline height, scaled by (targetHeight / baselineHeight). When
-// you reduce that algebraically for a single known target height (rather
-// than scaling from a separate reference photo, which the original tool was
-// built for), the baseline cancels out completely — every value collapses to
-// a fixed ratio of total height. That's what's hardcoded below for key
-// points, arms/legs, and movement (stride + speed).
-//
-// Feet are different: the source tool takes shoe size as an independent
-// INPUT and scales it — it never derives shoe size FROM height, so there's
-// no ratio to reduce. Foot length/width/EU size below are standard
-// real-world approximations instead (documented at FOOT_RATIOS), not
-// sourced from the uploaded calculator.
-//
-// Everything here is read-only and never stored: always recomputed live
-// from the "height" field, never sent through extraction, never lockable.
-// ---------------------------------------------------------------------------
-
-const PROPORTION_HEIGHT_THRESHOLD_CM = 200;
-
-const KEY_POINT_RATIOS = {
-    ankle: 1 / 21,
-    knee: 1.875 / 7,
-    crotch: 3.5 / 7,
-    hip: 4 / 7,
-    breast: 5 / 7, // simplified: source tool also applies a bra-cup correction term we can't reproduce without a tracked cup letter
-    neck: 5.75 / 7,
-    chin: 6 / 7,
-};
-const KEY_POINT_LABELS = {
-    ankle: 'Ankle', knee: 'Knee', crotch: 'Crotch', hip: 'Hip',
-    breast: 'Breast', neck: 'Neck', chin: 'Chin',
-};
-
-const ARM_LEG_RATIOS = {
-    armLength: 22 / 68,
-    legLength: 3.5 / 7, // crotch to floor — same ratio as the crotch key point, listed separately per the source tool
-    palmWidth: 0.525 / 9.2,
-    fingerLength: 0.475 / 9.2,
-    ringThickness: 0.68 / 68,
-};
-const ARM_LEG_LABELS = {
-    armLength: 'Arm length', legLength: 'Leg length (crotch to floor)',
-    palmWidth: 'Palm width', fingerLength: 'Middle finger length', ringThickness: 'Ring finger thickness',
-};
-
-// Stride lengths reduce the same way as everything above. Speed is stride
-// times an assumed step cadence (7200 steps/hour walking, 9600 running —
-// the source tool's own assumption), converted to km/h.
-const MOVEMENT_STRIDE_RATIOS = { walkStride: 26.5 / 68, runStride: 66 / 68 };
-const MOVEMENT_STEPS_PER_HOUR = { walkStride: 7200, runStride: 9600 };
-const MOVEMENT_LABELS = {
-    walkStride: 'Walking stride', runStride: 'Running stride',
-    walkSpeed: 'Walking speed', runSpeed: 'Running speed',
-};
-
-// Real-world approximations, not from the source calculator (see note
-// above): foot length ~15% of height; width ~39% of foot length; EU size
-// from the standard "cm × 1.5 + 2" shoe-fitting rule of thumb.
-const FOOT_LENGTH_RATIO = 0.15;
-const FOOT_WIDTH_RATIO = 0.39;
-const FOOT_LABELS = { length: 'Foot length', width: 'Foot width', euSize: 'Assumed EU shoe size' };
-
-function shouldShowProportions(entity) {
-    if (entity.fields.sex !== 'female') return false;
-    const heightNum = extractNumber(entity.fields.height);
-    return heightNum !== null && Number(heightNum) > PROPORTION_HEIGHT_THRESHOLD_CM;
-}
-
-function computeProportions(heightCm) {
-    const round1 = (n) => Math.round(n * 10) / 10;
-
-    const keyPoints = {};
-    for (const [key, ratio] of Object.entries(KEY_POINT_RATIOS)) {
-        keyPoints[key] = round1(heightCm * ratio);
-    }
-
-    const armsLegs = {};
-    for (const [key, ratio] of Object.entries(ARM_LEG_RATIOS)) {
-        armsLegs[key] = round1(heightCm * ratio);
-    }
-
-    const movement = {};
-    for (const [key, ratio] of Object.entries(MOVEMENT_STRIDE_RATIOS)) {
-        const strideCm = heightCm * ratio;
-        movement[key] = round1(strideCm);
-        const speedKey = key === 'walkStride' ? 'walkSpeed' : 'runSpeed';
-        movement[speedKey] = round1((strideCm * MOVEMENT_STEPS_PER_HOUR[key]) / 100000); // cm/hour -> km/h
-    }
-
-    const footLengthCm = heightCm * FOOT_LENGTH_RATIO;
-    const feet = {
-        length: round1(footLengthCm),
-        width: round1(footLengthCm * FOOT_WIDTH_RATIO),
-        euSize: Math.round(footLengthCm * 1.5 + 2),
-    };
-
-    return { keyPoints, armsLegs, movement, feet };
 }
 
 const defaultSettings = {
@@ -375,12 +251,6 @@ function ensureEntity(registry, name) {
     return registry.entities[name];
 }
 
-// Body detail visibility is purely automatic: tied to the "sex" field, which
-// is a fixed male/female choice (see SEX_OPTIONS + fieldRowHtml).
-function shouldShowBodyDetail(entity) {
-    return entity.fields.sex === 'female';
-}
-
 function valuesEqual(a, b) {
     if (Array.isArray(a) || Array.isArray(b)) {
         const arrA = (Array.isArray(a) ? a : [a]).map(String).sort();
@@ -429,7 +299,6 @@ function buildExtractionPrompt(chatSlice, registry) {
         '  "updates": {',
         '    "<character name>": {',
         `      "name": "...", "sex": "...", "age": "...", "pronouns": "...", "species": "...", "height": "...", "physique": "...",`,
-        `      "bust": "...", "waist": "...", "hip": "...",`,
         `      "relationship_to_user": "...", "weight": "...", "status": "...", "key_facts": ["..."]`,
         '    }',
         '  },',
@@ -442,23 +311,22 @@ function buildExtractionPrompt(chatSlice, registry) {
         '}',
         '',
         'Rules for "updates":',
-        '- For each character who appears in this transcript slice, include your best current understanding of every field you have information for — whether or not the registry already has a value for it. It is fine (and expected) to re-state a field that has not changed.',
-        '- Omit a field entirely if the transcript gives no information about it, rather than guessing.',
-        '- "physique" (general build, e.g. "athletic", "stocky", "slender") applies to any character.',
-        '- "sex" must be exactly "male" or "female" if it can be determined from the transcript. Omit it if unclear.',
-        '- "height" and "weight" must be given as a plain number only, in centimeters and kilograms respectively (e.g. "180", not "180cm" or "5\'11\""). Convert from imperial if the transcript uses it. Omit if not determinable as a number.',
-        '- "bust", "waist", "hip" are specific body measurements, each a plain number in centimeters only (e.g. "86", not "86cm"). Only include them for characters whose "sex" is female AND only when the transcript actually gives that information. Never invent numbers — omit all three rather than guess.',
+        '- For each character in this transcript slice, give your best current value for every field you have information for, whether or not the registry already has one. Re-stating an unchanged field is expected, not wasteful.',
+        '- Omit a field entirely if the transcript gives no information about it — never guess.',
+        '- "physique" is general build (e.g. "athletic", "stocky", "slender"), any character.',
+        '- "sex" must be exactly "male" or "female" if determinable, omitted otherwise.',
+        '- "height" and "weight" are plain numbers only, in centimeters and kilograms (e.g. "180", not "180cm" or "5\'11\""). Convert imperial units. Omit if not a determinable number.',
         '- Only include characters who actually appear in this transcript slice.',
-        '- "relationship_to_user" is ONLY for that character\'s relationship to {{user}}. Never describe a relationship between two OTHER tracked characters here — that always goes in the separate "relationships" array below instead, never as a key_facts entry either.',
+        '- "relationship_to_user" is ONLY that character\'s relationship to {{user}}. A relationship between two OTHER characters never goes here and never goes in key_facts — it always goes in the separate "relationships" array below.',
         '',
-        'Rules for "relationships" — this is a separate, structured fact store for relationships BETWEEN tracked characters (never involving {{user}}):',
-        '- "type" must be exactly one of: "parent_child", "spouse", "sibling", "other". Nothing else.',
-        '- "parent_child" uses "parent" and "child" (not "a"/"b") — get the direction right; this is the one the reader most needs unambiguous.',
-        '- "spouse" and "sibling" use "a" and "b" — order between them does not matter.',
-        '- "other" is for anything that doesn\'t fit the above (mentor, rival, employer, friend, enemy, etc.) — use "a", "b", and a short "label" verb-phrase such that "A is <label> B" reads naturally.',
-        '- Only include a relationship if the transcript actually states or clearly implies it. Never guess a family/social structure that wasn\'t established.',
-        '- Re-state a relationship you already knew about (from "Current relationships" below) if it\'s still true — this keeps it from being forgotten. Do not invent a new one that contradicts an existing entry unless the transcript explicitly changed it.',
-        '- Every name used here must be one of the tracked characters listed in "Current registry" below (or a character you are also introducing in this same "updates" object). Do not invent participants.',
+        'Rules for "relationships" — relationships BETWEEN tracked characters, never involving {{user}}:',
+        '- "type" is exactly one of: "parent_child", "spouse", "sibling", "other".',
+        '- "parent_child" uses "parent"/"child" (not "a"/"b") — the direction matters most here.',
+        '- "spouse" and "sibling" use "a"/"b"; order doesn\'t matter.',
+        '- "other" covers anything else (mentor, rival, employer, friend, enemy...) — "a", "b", plus a short "label" verb-phrase so "A is <label> B" reads naturally.',
+        '- Only include a relationship the transcript actually states or clearly implies — never invent a family/social structure.',
+        '- Re-state a relationship from "Current relationships" below if it\'s still true, so it isn\'t forgotten. Only contradict an existing one if the transcript explicitly changed it.',
+        '- Every name here must already be a tracked character in "Current registry" below, or one you\'re introducing in this same "updates" object — never invent a participant.',
         '',
         '### Current registry',
         JSON.stringify(currentRegistry, null, 2),
@@ -553,11 +421,6 @@ function mergeExtractionResult(registry, result) {
                 if (!normalized) continue;
                 proposed = normalized;
             }
-
-            // Belt-and-suspenders: even if the model ignores the prompt's
-            // instruction, never store body-detail fields for a non-female
-            // entity — keeps stored data consistent with what's ever visible.
-            if (BODY_DETAIL_FIELDS.includes(field) && entity.fields.sex !== 'female') continue;
 
             const current = entity.fields[field];
             const locked = !!entity.locks[field];
@@ -997,32 +860,11 @@ function formatEntityLine(name, entity) {
 
     if (f.physique) parts.push(`Build: ${f.physique}`);
 
-    const sizes = [f.bust, f.waist, f.hip];
-    if (shouldShowBodyDetail(entity) && sizes.some(Boolean)) {
-        if (sizes.every(Boolean)) {
-            parts.push(`Measurements (B/W/H): ${f.bust}/${f.waist}/${f.hip}`);
-        } else {
-            const labeled = [];
-            if (f.bust) labeled.push(`bust ${f.bust}`);
-            if (f.waist) labeled.push(`waist ${f.waist}`);
-            if (f.hip) labeled.push(`hip ${f.hip}`);
-            parts.push(`Measurements: ${labeled.join(', ')}`);
-        }
-    }
-
     if (f.relationship_to_user) parts.push(`Relationship to {{user}}: ${f.relationship_to_user}`);
     if (f.status) parts.push(`Status: ${f.status}`);
     if (f.weight) parts.push(`Weight: ${f.weight}`);
     if (Array.isArray(f.key_facts) && f.key_facts.length) {
         parts.push(`Facts: ${f.key_facts.join('; ')}`);
-    }
-
-    if (shouldShowProportions(entity)) {
-        const { keyPoints, armsLegs, movement, feet } = computeProportions(Number(extractNumber(f.height)));
-        parts.push(`Body-point heights from ground: ankle ${keyPoints.ankle}cm, knee ${keyPoints.knee}cm, crotch ${keyPoints.crotch}cm, hip ${keyPoints.hip}cm, breast ${keyPoints.breast}cm, neck ${keyPoints.neck}cm, chin ${keyPoints.chin}cm`);
-        parts.push(`Arm length ${armsLegs.armLength}cm, leg length (crotch to floor) ${armsLegs.legLength}cm, palm width ${armsLegs.palmWidth}cm, middle finger length ${armsLegs.fingerLength}cm`);
-        parts.push(`Walking stride ${movement.walkStride}cm at ${movement.walkSpeed}km/h, running stride ${movement.runStride}cm at ${movement.runSpeed}km/h`);
-        parts.push(`Feet approx. ${feet.length}cm long, ${feet.width}cm wide (EU ${feet.euSize})`);
     }
 
     return `${name}: ${parts.join('. ')}`;
@@ -1312,48 +1154,6 @@ function buildRelationshipConflictListHtml(registry) {
     return `<h4 class="crt_conflict_heading">⚠ Pending relationship conflicts (${registry.pendingRelationshipConflicts.length})</h4>${rows}`;
 }
 
-function proportionRowHtml(label, value, unit = 'cm') {
-    const display = unit ? `${value} ${unit}` : String(value);
-    return `<div class="crt_proportion_row"><span>${escapeHtml(label)}</span><span>${escapeHtml(display)}</span></div>`;
-}
-
-function proportionsBlockHtml(entity) {
-    if (!shouldShowProportions(entity)) return '';
-    const { keyPoints, armsLegs, movement, feet } = computeProportions(Number(extractNumber(entity.fields.height)));
-
-    const keyPointRows = Object.entries(keyPoints)
-        .map(([k, v]) => proportionRowHtml(KEY_POINT_LABELS[k], v))
-        .join('');
-    const armLegRows = Object.entries(armsLegs)
-        .map(([k, v]) => proportionRowHtml(ARM_LEG_LABELS[k], v))
-        .join('');
-    const movementRows = [
-        proportionRowHtml(MOVEMENT_LABELS.walkStride, movement.walkStride),
-        proportionRowHtml(MOVEMENT_LABELS.walkSpeed, movement.walkSpeed, 'km/h'),
-        proportionRowHtml(MOVEMENT_LABELS.runStride, movement.runStride),
-        proportionRowHtml(MOVEMENT_LABELS.runSpeed, movement.runSpeed, 'km/h'),
-    ].join('');
-    const feetRows = [
-        proportionRowHtml(FOOT_LABELS.length, feet.length),
-        proportionRowHtml(FOOT_LABELS.width, feet.width),
-        proportionRowHtml(FOOT_LABELS.euSize, feet.euSize, ''),
-    ].join('');
-
-    return `
-        <div class="crt_field_group">
-            <em>Proportions (auto — female, height over ${PROPORTION_HEIGHT_THRESHOLD_CM}cm)</em>
-            <div class="crt_hint">Read-only, recalculated live from height. Never stored, locked, or sent to extraction.</div>
-            <div class="crt_proportion_subhead">Height of key points (from the ground up)</div>
-            ${keyPointRows}
-            <div class="crt_proportion_subhead">Arms and legs</div>
-            ${armLegRows}
-            <div class="crt_proportion_subhead">Movement</div>
-            ${movementRows}
-            <div class="crt_proportion_subhead">Feet (assumed — real-world approximation, not exact)</div>
-            ${feetRows}
-        </div>`;
-}
-
 function criticalFactsBlockHtml(name, entity) {
     const safeName = escapeHtml(name);
     const facts = entity.criticalFacts || [];
@@ -1392,21 +1192,14 @@ function entityBlockHtml(name, entity, relCount) {
     const identityRows = IDENTITY_FIELDS
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
-    const bodyDetailSection = shouldShowBodyDetail(entity)
-        ? `<div class="crt_field_group"><em>Body detail</em>${BODY_DETAIL_FIELDS
-            .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
-            .join('')}</div>`
-        : '';
     const stateRows = STATE_FIELDS
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
 
     const bodyHtml = isCollapsed ? '' : `
             <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
-            ${bodyDetailSection}
             <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
-            ${criticalFactsBlockHtml(name, entity)}
-            ${proportionsBlockHtml(entity)}`;
+            ${criticalFactsBlockHtml(name, entity)}`;
 
     return `
         <div class="crt_entity_block${isCollapsed ? ' crt_collapsed' : ''}" data-entity="${safeName}">
