@@ -49,10 +49,12 @@ inspect it directly in a text editor.
 
 ## How it works
 
-- **Every field is dynamic by default.** name, sex, pronouns, species, height,
-  relationship_to_user, weight, status, key_facts — all of them get freely
-  overwritten on each extraction pass, no exceptions, until you decide
-  otherwise.
+- **Every structured field is dynamic by default.** name, sex, pronouns,
+  species, height, relationship_to_user, weight, status — all of them get
+  freely overwritten on each extraction pass, no exceptions, until you
+  decide otherwise (or until auto-lock does — see "Reliability & efficiency
+  pass" below). key_facts works differently: it's append-only, not
+  overwritten — see the same section.
 - **Locking is manual and per-field.** Check "lock" on any field to protect
   it. A locked-but-empty field still gets filled normally the first time
   there's data for it — locking doesn't block population, only *drift* once
@@ -109,6 +111,66 @@ matches how the SillyTavern community already writes this kind of always-on
 injected fact (e.g. `[Genre; Tags; Scenario]`), which reads as "world fact"
 rather than "text to imitate."
 
+## Reliability & efficiency pass
+
+Three changes, added after real-world testing at 2000+ messages showed
+80-90% fidelity with occasional drift — targeted at the remaining gap and
+at extraction cost on a large, long-running cast.
+
+**Auto-lock identity fields on first set** (on by default, toggle in
+settings). The first time `name`, `sex`, `pronouns`, or `species` gets a
+value — extracted or manually typed — it locks itself automatically. A
+later proposal that disagrees goes to the conflict queue instead of
+silently overwriting, the same protection you'd otherwise have to remember
+to set by hand per field per character. Deliberately excludes
+`height`/`weight`/`physique` (these can legitimately change — growth,
+injury, transformation) and `relationship_to_user` (expected to evolve).
+This is the direct fix for "characters occasionally drift from established
+values" — the previous defaults left every field unlocked until you
+manually protected it, which is exactly where silent drift sneaks in on a
+large cast you can't hand-lock character-by-character.
+
+**`key_facts` is now append-only**, the same fix the relationship graph
+already got, applied to general freeform facts. Extraction can only add a
+new fact; it can never rewrite or drop an existing one — previously the
+whole array got wholesale-replaced every pass, so a recap that simply
+missed mentioning an established fact would silently erase it. Duplicate
+detection is exact-string, case-insensitive; the extraction prompt is
+instructed not to bother re-listing facts already shown in the current
+registry, since restating adds nothing now that removal can't happen.
+Capped at 12 facts per character (oldest dropped first) so this can't grow
+unbounded over a very long campaign. Each fact now has its own delete
+button in the UI (add one manually too) instead of a single semicolon-
+separated text field.
+
+**The extraction prompt's registry/relationship dump is now filtered for
+large casts.** Below 9 tracked characters, nothing changes — full dump
+every time, since filtering adds a small risk for no real benefit at that
+size. Above that, only characters whose name (or a whole word of a
+multi-word name, so "Tom" still matches a tracked "Old Tom") actually
+appears in the current extraction window get included in "Current
+registry"/"Current relationships" — this is a straightforward token-cost
+win once a campaign's cast grows past a handful of people, most of whom
+aren't in any given scene.
+
+There's also a per-character **"exclude from extraction"** checkbox
+(next to "include in context") for permanent background characters — a
+shopkeeper mentioned once, a historical figure who'll never need updating.
+Checking it removes them from the extraction prompt entirely regardless of
+cast size or mentions, and the merge logic independently refuses to apply
+an update to an excluded character even if one somehow gets proposed
+anyway. It only affects extraction — has no effect on whether they're
+injected into the chat ("include in context" still controls that
+separately).
+
+**Not implemented, deliberately held in reserve:** splitting extraction
+into two smaller calls (fields, then relationships) to reduce simultaneous
+rule-count per call. This would roughly double extraction latency for a
+projected, unconfirmed accuracy gain — not a good trade by default given
+the fixes above already target the actual reported symptom. Worth
+revisiting as an opt-in setting if the three changes above don't close the
+remaining gap.
+
 ## Model-specific tuning
 
 The schema and extraction prompt were trimmed for reliability with
@@ -162,8 +224,10 @@ number in cm/kg directly (e.g. "70" for weight, not "154 lbs") — typing an
 imperial value will silently produce a wrong number rather than converting
 it.
 
-**Story state** (relationship_to_user, weight, status, key_facts) — the
-parts of a character expected to actually change over the story.
+**Story state** (relationship_to_user, weight, status) — the parts of a
+character expected to actually change over the story. key_facts sits
+alongside these conceptually but is its own append-only block now — see
+"Reliability & efficiency pass" below.
 
 > Removed as of the latest pass (see "Model-specific tuning" below): body
 > detail (bust/waist/hip) and the auto-computed body-proportion/movement/feet

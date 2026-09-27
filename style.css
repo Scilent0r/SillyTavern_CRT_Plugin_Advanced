@@ -125,7 +125,8 @@ h4.crt_conflict_heading {
 
 .crt_add_entity_row,
 .crt_add_relationship_row,
-.crt_add_critical_fact_row {
+.crt_add_critical_fact_row,
+.crt_add_key_fact_row {
     display: flex;
     flex-wrap: wrap;
     gap: 0.4em;
@@ -135,13 +136,10 @@ h4.crt_conflict_heading {
 .crt_add_entity_row input,
 .crt_add_relationship_row select,
 .crt_add_relationship_row input,
-.crt_add_critical_fact_row input {
+.crt_add_critical_fact_row input,
+.crt_add_key_fact_row input {
     flex: 1;
     min-width: 6em;
-}
-
-.crt_add_relationship_row .crt_add_relationship_label {
-    display: none; /* default select is parent_child; shown via JS when "other" is picked */
 }
 
 .crt_export_json_link {
@@ -201,6 +199,20 @@ h4.crt_conflict_heading {
     flex: 1;
 }
 
+/* ---- Key facts ---- */
+
+.crt_key_fact_row {
+    display: flex;
+    align-items: center;
+    gap: 0.5em;
+    padding: 0.2em 0;
+    font-size: 0.9em;
+}
+
+.crt_key_fact_text {
+    flex: 1;
+}
+
 /* ---- Per-character cards ---- */
 
 .crt_entity_block {
@@ -218,6 +230,8 @@ h4.crt_conflict_heading {
     display: flex;
     align-items: center;
     gap: 0.8em;
+    flex-wrap: wrap; /* defensive fallback only — badges + toggles-row move
+                        below normally handle narrow widths without wrapping */
 }
 
 .crt_entity_block:not(.crt_collapsed) .crt_entity_header {
@@ -263,6 +277,26 @@ h4.crt_conflict_heading {
 .crt_entity_summary_empty {
     opacity: 0.5;
     font-style: italic;
+}
+
+/* Icon-only header badges for the exceptional (non-default) toggle states —
+   see entityBlockHtml(): rendered only when included===false or
+   excludeFromExtraction is true, so a normal character shows neither. */
+.crt_entity_status_badge {
+    flex-shrink: 0;
+    font-size: 0.8em;
+    opacity: 0.8;
+    color: var(--warning, #b58900);
+}
+
+/* The two toggles that used to live in the header itself; now their own row
+   inside the expanded body, directly under the header. */
+.crt_entity_toggles_row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4em 1em;
+    margin: 0 0 0.5em 0;
+    font-size: 0.9em;
 }
 
 .crt_field_group em {

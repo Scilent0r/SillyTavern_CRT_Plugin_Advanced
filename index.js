@@ -28,10 +28,19 @@ const expandedEntityNames = new Set();
 
 // Purely cosmetic grouping for the UI.
 const IDENTITY_FIELDS = ['name', 'sex', 'age', 'pronouns', 'species', 'height', 'physique'];
-const STATE_FIELDS = ['relationship_to_user', 'weight', 'status', 'key_facts'];
+const STATE_FIELDS = ['relationship_to_user', 'weight', 'status'];
 const ALL_FIELDS = [...IDENTITY_FIELDS, ...STATE_FIELDS];
-const ARRAY_FIELDS = ['key_facts'];
 const SEX_OPTIONS = ['', 'male', 'female']; // '' = unset
+const MAX_KEY_FACTS = 12; // soft cap — oldest dropped on overflow, see mergeKeyFacts
+
+// Fields that essentially never legitimately change mid-campaign. When
+// autoLockIdentityFields is on (default), setting one of these for the
+// FIRST time — extracted or manual — locks it automatically, so later drift
+// has to go through the conflict queue instead of silently overwriting it.
+// Deliberately excludes height/weight/physique: those genuinely can change
+// (growth, injury, transformation) and relationship_to_user, which is
+// expected to evolve by design.
+const AUTO_LOCK_FIELDS = ['name', 'sex', 'pronouns', 'species'];
 
 // Stencil for the standalone Height Comparison export is fully automatic
 // (sex-based, see pickStencilForExport) — no per-character manual override.
@@ -50,8 +59,11 @@ const EXPORT_COLOR_PALETTE = ['#2E5C8A', '#B5502F', '#3E7A4C', '#C79A2E', '#6B4E
 // guarantee — two independent free-text facts ("Halfrun's child: Runa" on
 // one card, "Runa's parent: Halfrun" on another) can drift apart across
 // extraction passes, and previously the only place for this kind of fact was
-// key_facts, an array that gets wholesale-replaced (not merged) every pass.
-// That's the actual mechanism behind parents/children getting mixed up.
+// key_facts, an array that used to get wholesale-replaced (not merged) every
+// pass — since fixed to be append-only (see mergeKeyFacts), but relationships
+// still needed their own structure since key_facts has no concept of TWO
+// characters sharing one fact, only "things true about this one character".
+// That mismatch is the actual mechanism behind parents/children getting mixed up.
 //
 // Fix: one canonical edge per relationship, stored once at the registry
 // level (not owned by either character), with a fixed small vocabulary of
@@ -99,7 +111,14 @@ function relationshipSentence(rel) {
             return `${rel.a} and ${rel.b} are siblings.`;
         case 'other':
         default:
-            return `${rel.a} is ${rel.label || 'connected to'} ${rel.b}.`;
+            // No hardcoded "is" here — the label is a full connecting
+            // phrase (own verb included), not a modifier expecting one
+            // prepended. A fixed "is <label>" produced ungrammatical or
+            // unintentionally funny results whenever the extracted/typed
+            // label already carried its own verb, e.g. label "competition
+            // over" -> "Svenna is competition over Daniel" instead of the
+            // intended "Svenna is in competition over Daniel" or similar.
+            return `${rel.a} ${rel.label || 'is connected to'} ${rel.b}.`;
     }
 }
 
@@ -124,6 +143,7 @@ function normalizeMeasurement(rawValue, unit) {
 const defaultSettings = {
     enabled: true,
     autoExtract: true,
+    autoLockIdentityFields: true, // see AUTO_LOCK_FIELDS below and README "Auto-lock"
     extractEveryN: 30,       // messages since last extraction before auto-firing
     extractionWindow: 40,    // how many recent messages get sent to the extractor
     injectionDepth: 1,       // depth 0-2 stays closest to the strongest-attention zone (see README)
@@ -242,6 +262,7 @@ function ensureEntity(registry, name) {
             fields: {},
             locks: {},
             included: true,
+            excludeFromExtraction: false, // manual, permanent-background characters — see buildExtractionPrompt
             criticalFacts: [], // manual-only hard constraints — never touched by extraction, see README
         };
     }
@@ -273,22 +294,48 @@ function escapeHtml(str) {
 // Extraction
 // ---------------------------------------------------------------------------
 
+// Registries at or below this size always get a full dump — filtering adds
+// a small risk (a character mentioned only by nickname could get missed)
+// for no real benefit until the cast is big enough that dump size actually
+// matters. Word-level matching (not full-name substring) is deliberately
+// forgiving: "Tom" mentioned in the transcript still matches a tracked
+// "Old Tom", so a nickname doesn't silently drop someone from context.
+const EXTRACTION_FILTER_THRESHOLD = 8;
+
+function nameAppearsInText(name, textLower) {
+    const words = name.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+    return words.length === 0 ? textLower.includes(name.toLowerCase()) : words.some(w => textLower.includes(w));
+}
+
 function buildExtractionPrompt(chatSlice, registry) {
     const transcript = chatSlice
         .filter(m => !m.is_system)
         .map(m => `${m.name || (m.is_user ? 'User' : 'Assistant')}: ${m.mes}`)
         .join('\n');
 
+    const trackedNames = Object.keys(registry.entities).filter(n => !registry.entities[n].excludeFromExtraction);
+    const shouldFilter = trackedNames.length > EXTRACTION_FILTER_THRESHOLD;
+    const transcriptLower = transcript.toLowerCase();
+    const relevantNames = shouldFilter
+        ? trackedNames.filter(n => nameAppearsInText(n, transcriptLower))
+        : trackedNames;
+    const relevantNameSet = new Set(relevantNames);
+
     const currentRegistry = {};
-    for (const [name, entity] of Object.entries(registry.entities)) {
-        currentRegistry[name] = entity.fields;
+    for (const name of relevantNames) {
+        currentRegistry[name] = registry.entities[name].fields;
     }
 
-    const currentRelationships = registry.relationships.map(rel => ({
-        type: rel.type,
-        ...(rel.type === 'parent_child' ? { parent: rel.parent, child: rel.child } : { a: rel.a, b: rel.b }),
-        ...(rel.type === 'other' ? { label: rel.label } : {}),
-    }));
+    const currentRelationships = registry.relationships
+        .filter(rel => {
+            const [p1, p2] = relationshipParticipants(rel);
+            return relevantNameSet.has(p1) || relevantNameSet.has(p2);
+        })
+        .map(rel => ({
+            type: rel.type,
+            ...(rel.type === 'parent_child' ? { parent: rel.parent, child: rel.child } : { a: rel.a, b: rel.b }),
+            ...(rel.type === 'other' ? { label: rel.label } : {}),
+        }));
 
     return [
         'You maintain a structured fact registry about the characters in a roleplay chat.',
@@ -306,24 +353,25 @@ function buildExtractionPrompt(chatSlice, registry) {
         '    { "type": "parent_child", "parent": "<name>", "child": "<name>" },',
         '    { "type": "spouse", "a": "<name>", "b": "<name>" },',
         '    { "type": "sibling", "a": "<name>", "b": "<name>" },',
-        '    { "type": "other", "a": "<name>", "b": "<name>", "label": "<short verb phrase, e.g. \\"mentor of\\", \\"rival of\\", \\"employer of\\">" }',
+        '    { "type": "other", "a": "<name>", "b": "<name>", "label": "<full connecting phrase with its OWN verb, e.g. \\"is mentor to\\", \\"is rival of\\", \\"works for\\", \\"is in competition with\\">" }',
         '  ]',
         '}',
         '',
         'Rules for "updates":',
-        '- For each character in this transcript slice, give your best current value for every field you have information for, whether or not the registry already has one. Re-stating an unchanged field is expected, not wasteful.',
+        '- For each character in this transcript slice, give your best current value for every field you have information for (except "key_facts", which works differently — see below), whether or not the registry already has one. Re-stating an unchanged field is expected, not wasteful.',
         '- Omit a field entirely if the transcript gives no information about it — never guess.',
         '- "physique" is general build (e.g. "athletic", "stocky", "slender"), any character.',
         '- "sex" must be exactly "male" or "female" if determinable, omitted otherwise.',
         '- "height" and "weight" are plain numbers only, in centimeters and kilograms (e.g. "180", not "180cm" or "5\'11\""). Convert imperial units. Omit if not a determinable number.',
         '- Only include characters who actually appear in this transcript slice.',
         '- "relationship_to_user" is ONLY that character\'s relationship to {{user}}. A relationship between two OTHER characters never goes here and never goes in key_facts — it always goes in the separate "relationships" array below.',
+        '- "key_facts" is additive: anything you list gets appended to what\'s already known, nothing is ever erased by this field. So there\'s no need to repeat facts already shown in "Current registry" below — only list NEW facts from this transcript slice that aren\'t covered yet. Omit the field entirely if nothing new came up.',
         '',
         'Rules for "relationships" — relationships BETWEEN tracked characters, never involving {{user}}:',
         '- "type" is exactly one of: "parent_child", "spouse", "sibling", "other".',
         '- "parent_child" uses "parent"/"child" (not "a"/"b") — the direction matters most here.',
         '- "spouse" and "sibling" use "a"/"b"; order doesn\'t matter.',
-        '- "other" covers anything else (mentor, rival, employer, friend, enemy...) — "a", "b", plus a short "label" verb-phrase so "A is <label> B" reads naturally.',
+        '- "other" covers anything else (mentor, rival, employer, friend, enemy...) — "a", "b", plus a "label" that is the FULL connecting phrase, own verb included (e.g. "is mentor to", not just "mentor to") — it is inserted as-is between the two names ("A <label> B"), nothing is prepended for you.',
         '- Only include a relationship the transcript actually states or clearly implies — never invent a family/social structure.',
         '- Re-state a relationship from "Current relationships" below if it\'s still true, so it isn\'t forgotten. Only contradict an existing one if the transcript explicitly changed it.',
         '- Every name here must already be a tracked character in "Current registry" below, or one you\'re introducing in this same "updates" object — never invent a participant.',
@@ -389,6 +437,33 @@ function parseExtractionResult(rawText) {
     return JSON.parse(candidate);
 }
 
+function mergeKeyFacts(entity, proposedFacts) {
+    if (proposedFacts === undefined || proposedFacts === null) return false;
+    const proposedList = (Array.isArray(proposedFacts) ? proposedFacts : [proposedFacts])
+        .map(f => String(f).trim())
+        .filter(Boolean);
+    if (proposedList.length === 0) return false;
+
+    if (!Array.isArray(entity.fields.key_facts)) entity.fields.key_facts = [];
+    const existingLower = new Set(entity.fields.key_facts.map(f => f.toLowerCase()));
+
+    let added = false;
+    for (const fact of proposedList) {
+        if (existingLower.has(fact.toLowerCase())) continue; // already known — append-only, never replaces
+        entity.fields.key_facts.push(fact);
+        existingLower.add(fact.toLowerCase());
+        added = true;
+    }
+
+    // Soft cap: drop the oldest rather than let a long campaign grow this
+    // field (and the extraction prompt's context of it) without bound.
+    if (entity.fields.key_facts.length > MAX_KEY_FACTS) {
+        entity.fields.key_facts = entity.fields.key_facts.slice(-MAX_KEY_FACTS);
+    }
+
+    return added;
+}
+
 function mergeExtractionResult(registry, result) {
     const updates = result.updates || {};
     let touched = 0;
@@ -397,14 +472,13 @@ function mergeExtractionResult(registry, result) {
         const name = String(rawName).trim();
         if (!name) continue;
         const entity = ensureEntity(registry, name);
-        let entityTouched = false;
+        if (entity.excludeFromExtraction) continue; // safety net — should already be absent from the prompt entirely
+        let entityTouched = mergeKeyFacts(entity, data.key_facts);
 
         for (const field of ALL_FIELDS) {
             if (data[field] === undefined || data[field] === null || data[field] === '') continue;
 
-            let proposed = ARRAY_FIELDS.includes(field) && !Array.isArray(data[field])
-                ? [data[field]]
-                : data[field];
+            let proposed = data[field];
 
             // "sex" is a fixed male/female choice (drives body-detail visibility) —
             // normalize casing and reject anything that isn't exactly one of the two.
@@ -414,8 +488,8 @@ function mergeExtractionResult(registry, result) {
                 proposed = normalized;
             }
 
-            // height/weight/bust/waist/hip must be "<number><unit>" — reject
-            // anything with no extractable number rather than storing free text.
+            // height/weight must be "<number><unit>" — reject anything with
+            // no extractable number rather than storing free text.
             if (UNIT_FIELDS[field]) {
                 const normalized = normalizeMeasurement(proposed, UNIT_FIELDS[field]);
                 if (!normalized) continue;
@@ -427,8 +501,12 @@ function mergeExtractionResult(registry, result) {
 
             if (!locked) {
                 if (!valuesEqual(current, proposed)) {
+                    const isFirstSet = current === undefined;
                     entity.fields[field] = proposed;
                     entityTouched = true;
+                    if (isFirstSet && AUTO_LOCK_FIELDS.includes(field) && getSettings().autoLockIdentityFields) {
+                        entity.locks[field] = true;
+                    }
                 }
                 continue;
             }
@@ -1087,7 +1165,7 @@ function conflictRowHtml(conflict) {
 function relationshipRowHtml(rel) {
     const safeId = escapeHtml(rel.id);
     const labelInput = rel.type === 'other'
-        ? `<input type="text" class="text_pole crt_relationship_label_input" data-id="${safeId}" value="${escapeHtml(rel.label || '')}" placeholder="e.g. mentor of" />`
+        ? `<input type="text" class="text_pole crt_relationship_label_input" data-id="${safeId}" value="${escapeHtml(rel.label || '')}" placeholder="e.g. is mentor to" />`
         : '';
     return `
         <div class="crt_relationship_row" data-id="${safeId}">
@@ -1111,14 +1189,12 @@ function buildRelationshipListHtml(registry) {
 // Populates the two name dropdowns in an "Add relationship" row from
 // currently tracked characters — a dropdown can't typo or mis-case a name
 // the way free text could, so this replaces what used to be manual entry
-// plus a forgiving lookup. Placeholder option text swaps to Parent/Child
-// for that type, First/Second person otherwise. Preserves the current
-// selection across a refresh where possible.
+// plus a forgiving lookup. Preserves the current selection across a refresh
+// where possible. Manual adds are always type "other" (see
+// relationshipsBodyHtml), so there's no parent/child-specific labeling here.
 function populateRelationshipNameSelects($row, registry) {
-    const type = $row.find('.crt_add_relationship_type').val();
-    const isParentChild = type === 'parent_child';
-    const label1 = isParentChild ? 'Parent' : 'First person';
-    const label2 = isParentChild ? 'Child' : 'Second person';
+    const label1 = 'First person';
+    const label2 = 'Second person';
     const names = Object.keys(registry.entities).sort();
 
     const optionsHtml = (placeholderLabel) => [
@@ -1152,6 +1228,27 @@ function buildRelationshipConflictListHtml(registry) {
     if (registry.pendingRelationshipConflicts.length === 0) return '';
     const rows = registry.pendingRelationshipConflicts.map(relationshipConflictRowHtml).join('');
     return `<h4 class="crt_conflict_heading">⚠ Pending relationship conflicts (${registry.pendingRelationshipConflicts.length})</h4>${rows}`;
+}
+
+function keyFactsBlockHtml(name, entity) {
+    const safeName = escapeHtml(name);
+    const facts = entity.fields.key_facts || [];
+    const rows = facts.map((fact, i) => `
+        <div class="crt_key_fact_row" data-entity="${safeName}" data-index="${i}">
+            <span class="crt_key_fact_text">${escapeHtml(fact)}</span>
+            <button class="menu_button crt_key_fact_delete" data-entity="${safeName}" data-index="${i}">Delete</button>
+        </div>`).join('');
+
+    return `
+        <div class="crt_field_group">
+            <em>Key facts</em>
+            <div class="crt_hint">Append-only — extraction can only add a new fact here, never rewrite or drop an existing one (that was the actual cause of established facts occasionally getting lost or contradicted). Remove one manually if it's no longer true. Capped at ${MAX_KEY_FACTS}; oldest drops off first.</div>
+            ${rows || '<div class="crt_empty">None yet.</div>'}
+            <div class="crt_add_key_fact_row">
+                <input type="text" class="text_pole crt_add_key_fact_input" data-entity="${safeName}" placeholder="e.g. distrusts merchants after being cheated in Highwater" />
+                <button class="menu_button crt_add_key_fact_btn" data-entity="${safeName}">Add</button>
+            </div>
+        </div>`;
 }
 
 function criticalFactsBlockHtml(name, entity) {
@@ -1196,9 +1293,46 @@ function entityBlockHtml(name, entity, relCount) {
         .map(f => fieldRowHtml(name, f, entity.fields[f], !!entity.locks[f]))
         .join('');
 
+    // Compact header badges — icon-only, and only rendered for the
+    // NON-default state, so an ordinary character (included, not
+    // extraction-excluded) adds nothing to the header at all. Shown whether
+    // the card is collapsed or expanded, so moving the actual toggles below
+    // (out of the header) never hides an exceptional state from a glance.
+    const badges = [];
+    if (entity.included === false) {
+        badges.push('<span class="crt_entity_status_badge fa-solid fa-eye-slash" title="Not included in context injection"></span>');
+    }
+    if (entity.excludeFromExtraction) {
+        badges.push('<span class="crt_entity_status_badge fa-solid fa-ban" title="Excluded from extraction"></span>');
+    }
+    const badgesHtml = badges.join('');
+
+    // The two toggles used to sit as full checkbox+label controls directly
+    // in the (unwrapped, single-line) header row alongside the name — fine
+    // at settings-drawer width, but on anything narrower (the floating
+    // window resized down, or a phone) they had nowhere to go and
+    // overlapped the name instead of wrapping. Moved into the expanded body
+    // as their own row instead; see badgesHtml above for what replaces them
+    // in the header itself.
+    const togglesRowHtml = `
+            <div class="crt_entity_toggles_row">
+                <label class="checkbox_label">
+                    <input type="checkbox" class="crt_include_toggle" data-entity="${safeName}"
+                        ${entity.included ? 'checked' : ''} />
+                    include in context
+                </label>
+                <label class="checkbox_label" title="Skip this character entirely during extraction — their data won't be shown to or updated by the model. For permanent background characters in a large cast; doesn't affect chat injection, only extraction.">
+                    <input type="checkbox" class="crt_exclude_extraction_toggle" data-entity="${safeName}"
+                        ${entity.excludeFromExtraction ? 'checked' : ''} />
+                    exclude from extraction
+                </label>
+            </div>`;
+
     const bodyHtml = isCollapsed ? '' : `
+            ${togglesRowHtml}
             <div class="crt_field_group"><em>Identity</em>${identityRows}</div>
             <div class="crt_field_group"><em>Story state</em>${stateRows}</div>
+            ${keyFactsBlockHtml(name, entity)}
             ${criticalFactsBlockHtml(name, entity)}`;
 
     return `
@@ -1206,14 +1340,9 @@ function entityBlockHtml(name, entity, relCount) {
             <div class="crt_entity_header">
                 <div class="crt_entity_toggle_zone" title="${isCollapsed ? 'Expand' : 'Collapse'}">
                     <span class="crt_entity_collapse_toggle fa-solid ${isCollapsed ? 'fa-chevron-right' : 'fa-chevron-down'}"></span>
-                    <strong>${safeName}</strong>
+                    <strong>${safeName}</strong>${badgesHtml}
                     ${isCollapsed ? `<span class="crt_entity_summary">${entitySummaryLine(entity, relCount)}</span>` : ''}
                 </div>
-                <label class="checkbox_label">
-                    <input type="checkbox" class="crt_include_toggle" data-entity="${safeName}"
-                        ${entity.included ? 'checked' : ''} />
-                    include in context
-                </label>
                 <button class="menu_button crt_delete_entity" data-entity="${safeName}">Delete</button>
             </div>${bodyHtml}
         </div>`;
@@ -1255,7 +1384,7 @@ function renderEntityList() {
     const active = document.activeElement;
     const isEditingField = active && (
         active.classList.contains('crt_field_input') || active.classList.contains('crt_add_entity_input') ||
-        active.classList.contains('crt_add_critical_fact_input')
+        active.classList.contains('crt_add_critical_fact_input') || active.classList.contains('crt_add_key_fact_input')
     );
     const isEditingRelationship = active && (
         active.classList.contains('crt_relationship_label_input') ||
@@ -1320,6 +1449,7 @@ function bindEntityListEvents() {
         const entity = ensureEntity(registry, $el.data('entity'));
         const field = $el.data('field');
         const value = $el.val();
+        const wasEmpty = entity.fields[field] === undefined || entity.fields[field] === '';
 
         if (UNIT_FIELDS[field]) {
             const normalized = normalizeMeasurement(value, UNIT_FIELDS[field]);
@@ -1329,10 +1459,12 @@ function bindEntityListEvents() {
                 return;
             }
             entity.fields[field] = normalized ?? '';
-        } else if (ARRAY_FIELDS.includes(field)) {
-            entity.fields[field] = value.split(';').map(s => s.trim()).filter(Boolean);
         } else {
             entity.fields[field] = value;
+            // Same auto-lock-on-first-set as extraction — see AUTO_LOCK_FIELDS.
+            if (wasEmpty && value && AUTO_LOCK_FIELDS.includes(field) && getSettings().autoLockIdentityFields) {
+                entity.locks[field] = true;
+            }
         }
 
         saveRegistry(registry);
@@ -1358,6 +1490,14 @@ function bindEntityListEvents() {
         entity.included = $el.is(':checked');
         saveRegistry(registry);
         updateInjection();
+    });
+
+    $doc.on('change', '.crt_exclude_extraction_toggle', function () {
+        const $el = $(this);
+        const registry = getRegistry();
+        const entity = ensureEntity(registry, $el.data('entity'));
+        entity.excludeFromExtraction = $el.is(':checked');
+        saveRegistry(registry);
     });
 
     $doc.on('click', '.crt_delete_entity', function () {
@@ -1397,6 +1537,39 @@ function bindEntityListEvents() {
         const registry = getRegistry();
         const entity = ensureEntity(registry, name);
         entity.criticalFacts.splice(index, 1);
+        saveRegistry(registry);
+        updateInjection();
+        renderEntityList();
+    });
+
+    $doc.on('click', '.crt_add_key_fact_btn', function () {
+        const name = $(this).data('entity');
+        const $input = $(this).siblings('.crt_add_key_fact_input');
+        const text = $input.val().trim();
+        if (!text) return;
+
+        const registry = getRegistry();
+        const entity = ensureEntity(registry, name);
+        if (!Array.isArray(entity.fields.key_facts)) entity.fields.key_facts = [];
+        entity.fields.key_facts.push(text);
+        saveRegistry(registry);
+        updateInjection();
+        renderEntityList();
+    });
+    $doc.on('keydown', '.crt_add_key_fact_input', function (e) {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            $(this).trigger('blur');
+            $(this).siblings('.crt_add_key_fact_btn').trigger('click');
+        }
+    });
+
+    $doc.on('click', '.crt_key_fact_delete', function () {
+        const name = $(this).data('entity');
+        const index = $(this).data('index');
+        const registry = getRegistry();
+        const entity = ensureEntity(registry, name);
+        if (Array.isArray(entity.fields.key_facts)) entity.fields.key_facts.splice(index, 1);
         saveRegistry(registry);
         updateInjection();
         renderEntityList();
@@ -1506,19 +1679,12 @@ function bindEntityListEvents() {
         renderEntityList();
     });
 
-    $doc.on('change', '.crt_add_relationship_type', function () {
-        const $row = $(this).closest('.crt_add_relationship_row');
-        populateRelationshipNameSelects($row, getRegistry());
-        $row.find('.crt_add_relationship_label').toggle($(this).val() === 'other');
-    });
-
     $doc.on('click', '.crt_add_relationship_btn', function () {
         const $row = $(this).closest('.crt_add_relationship_row');
         const added = addRelationshipManually(
-            $row.find('.crt_add_relationship_type').val(),
             $row.find('.crt_add_relationship_name1').val(),
-            $row.find('.crt_add_relationship_name2').val(),
             $row.find('.crt_add_relationship_label').val(),
+            $row.find('.crt_add_relationship_name2').val(),
         );
         if (added) {
             $row.find('.crt_add_relationship_name1, .crt_add_relationship_name2, .crt_add_relationship_label').val('');
@@ -1539,6 +1705,9 @@ function bindEntityListEvents() {
     });
     $doc.on('change', '#crt_auto_extract', function () {
         getSettings().autoExtract = $(this).is(':checked');
+    });
+    $doc.on('change', '#crt_auto_lock', function () {
+        getSettings().autoLockIdentityFields = $(this).is(':checked');
     });
     $doc.on('change', '#crt_extract_every_n', function () {
         getSettings().extractEveryN = Number($(this).val()) || defaultSettings.extractEveryN;
@@ -1604,13 +1773,15 @@ function upsertRelationshipManually(registry, rel) {
     }
 }
 
-function addRelationshipManually(type, rawName1, rawName2, rawLabel) {
+// Manual adds are always type "other" — the fixed parent_child/spouse/
+// sibling vocabulary exists so a small extraction model has an unambiguous,
+// bounded choice (see the design note above RELATIONSHIP_TYPES); a person
+// typing the relationship out by hand doesn't have that reliability problem,
+// so they just write the whole phrase. Extraction can still produce the
+// other three types; they're just not offered here as a manual option.
+function addRelationshipManually(rawName1, rawLabel, rawName2) {
     const registry = getRegistry();
 
-    if (!RELATIONSHIP_TYPES.includes(type)) {
-        setStatus('Pick a relationship type first.', 'error');
-        return false;
-    }
     if (!String(rawName1 || '').trim() || !String(rawName2 || '').trim()) {
         setStatus('Both names are needed to add a relationship.', 'error');
         return false;
@@ -1627,12 +1798,12 @@ function addRelationshipManually(type, rawName1, rawName2, rawLabel) {
         setStatus('A character can\'t have a relationship with themselves.', 'error');
         return false;
     }
+    if (!String(rawLabel || '').trim()) {
+        setStatus('Describe the relationship (e.g. "is rivals with") before adding it.', 'error');
+        return false;
+    }
 
-    const rel = type === 'parent_child'
-        ? { type, parent: name1, child: name2 }
-        : type === 'other'
-            ? { type, a: name1, b: name2, label: String(rawLabel || '').trim() || 'connected to' }
-            : { type, a: name1, b: name2 };
+    const rel = { type: 'other', a: name1, b: name2, label: String(rawLabel).trim() };
 
     upsertRelationshipManually(registry, rel);
     saveRegistry(registry);
@@ -1720,18 +1891,22 @@ function worldNotesBodyHtml() {
 }
 
 function relationshipsBodyHtml() {
-    const typeOptionsHtml = RELATIONSHIP_TYPES
-        .map(t => `<option value="${t}">${escapeHtml(RELATIONSHIP_TYPE_LABELS[t])}</option>`)
-        .join('');
+    // Manual adds are always type "other" with a free-typed phrase — a
+    // person typing the whole sentence doesn't need the bounded
+    // parent_child/spouse/sibling/other vocabulary that extraction relies
+    // on for small-model reliability (see the design note above
+    // RELATIONSHIP_TYPES). That vocabulary is still what extraction uses
+    // and still what's DISPLAYED for existing relationships either way —
+    // this only drops the type dropdown from the add-row itself, down to
+    // the three controls asked for: character, phrase, character.
     return `
                 <p class="crt_hint">How tracked characters relate to EACH OTHER — not to {{user}} (that's still each character's own "relationship_to_user" field). One shared entry per relationship rather than a copy on each side, so there's nothing for two cards to contradict. Lock a relationship to protect it — a later proposal that disagrees (a changed label, or a new, contradicting parent/spouse) is queued below instead of applied silently.</p>
                 <div class="crt_relationship_conflict_list_target"></div>
                 <div class="crt_relationship_list_target"></div>
                 <div class="crt_add_relationship_row">
-                    <select class="text_pole crt_add_relationship_type">${typeOptionsHtml}</select>
                     <select class="text_pole crt_add_relationship_name1"></select>
+                    <input type="text" class="text_pole crt_add_relationship_label" placeholder="e.g. is rivals with" />
                     <select class="text_pole crt_add_relationship_name2"></select>
-                    <input type="text" class="text_pole crt_add_relationship_label" placeholder="Label (e.g. mentor of)" />
                     <button class="menu_button crt_add_relationship_btn">Add relationship</button>
                 </div>`;
 }
@@ -1760,6 +1935,10 @@ function settingsPanelHtml() {
                 <label class="checkbox_label">
                     <input type="checkbox" id="crt_auto_extract" ${settings.autoExtract ? 'checked' : ''} />
                     Auto-extract periodically
+                </label>
+                <label class="checkbox_label" title="Locks name/sex/pronouns/species the first time each gets a value, extracted or manual. A later disagreeing proposal goes to the conflict queue instead of overwriting silently.">
+                    <input type="checkbox" id="crt_auto_lock" ${settings.autoLockIdentityFields ? 'checked' : ''} />
+                    Auto-lock identity fields on first set
                 </label>
                 <div class="crt_setting_row">
                     <label for="crt_extract_every_n">Extract every N messages</label>
