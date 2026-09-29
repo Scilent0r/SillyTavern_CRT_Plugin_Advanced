@@ -61,6 +61,9 @@ This was built and tuned against a 31B creative-writing finetune, and stayed rou
 - `manifest.json` — SillyTavern extension metadata
 
 # Settings
-<img width="638" height="1091" alt="kuva" src="https://github.com/user-attachments/assets/d5db336a-a12b-47dd-8cfb-bcf7ad578ad5" />
 
 I run the plugin with the following settings. Extraction response length has to be long enough that the json is not cut and thus cause extraction failures for invalid json.
+
+<img width="638" height="1091" alt="kuva" src="https://github.com/user-attachments/assets/d5db336a-a12b-47dd-8cfb-bcf7ad578ad5" />
+
+
