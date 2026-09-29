@@ -6,7 +6,7 @@ If you've ever restarted KoboldCPP or reloaded SillyTavern and come back to find
 
 ## The problem
 
-Long roleplay chats lose track of details. A character's height, who's married to whom, that one character is secretly the other's father — none of that lives anywhere durable. It's only as "remembered" as whatever happens to still be inside the model's context window. Reboot the backend, hit a context limit, or just have a long enough conversation, and facts get overwritten, contradicted, or dropped entirely.
+Long roleplay chats lose track of details. A character's info, who's married to whom, that one character is the other's boss or wife — none of that lives anywhere durable. It's only as "remembered" as whatever happens to still be inside the model's context window. Reboot the backend, hit a context limit, or just have a long enough conversation, and facts get overwritten, contradicted, or dropped entirely.
 
 **Character Registry Tracker** fixes this by keeping a small, structured fact sheet for every character, stored directly in the chat itself (not a separate file), and force-feeding that fact sheet into every single generation — no matter how long the conversation gets or how many times you restart your backend.
 
@@ -17,7 +17,7 @@ They solve different problems and work well together:
 - **MemoryBooks** watches your conversation and writes *event/plot summaries* — "what happened" — into keyword-triggered lorebook entries. Great for long-term plot memory, but it only surfaces when a keyword matches, and it needs a Chat Completion–style API.
 - **Character Registry Tracker** tracks *entity state* — "who is who, right now" — and injects it into **every** message, unconditionally. No keywords, no triggers, no Chat Completion requirement. It works over plain KoboldCPP text completion.
 
-Use MemoryBooks for "what happened three chapters ago." Use this for "does the model still know my character is 50 meters tall and married to Halfrun."
+Use MemoryBooks for "what happened three chapters ago." Use this for "does the model still know my character is an elf and has a halfling son called Halfrun."
 
 ## What it does
 
