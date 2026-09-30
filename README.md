@@ -34,6 +34,8 @@ Use MemoryBooks for "what happened three chapters ago." Use this for "does the m
 1. Copy the `character-registry-tracker` folder into your SillyTavern `extensions` folder.
 2. Reload SillyTavern (or use the extension manager's reload).
 3. Look for **Character Registry** in your extensions list, and a new toolbar button to open its panel.
+   <img width="1334" height="56" alt="kuva" src="https://github.com/user-attachments/assets/bafd2452-e97c-4e21-b63a-26384077ae67" />
+
 
 ## Using it
 
