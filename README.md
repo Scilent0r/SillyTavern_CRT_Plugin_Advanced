@@ -52,6 +52,8 @@ Use MemoryBooks for "what happened three chapters ago." Use this for "does the m
 
 If you're running KoboldCPP directly, you can point the extension at its API URL in settings. This uses KoboldCPP's grammar-constrained generation to *guarantee* the extraction output is valid JSON, which cuts down on parse failures significantly — especially with smaller or heavily creativity-tuned models. This is optional; the extension works without it, just with a slightly higher chance of an extraction pass failing to parse (it'll just retry next time).
 
+PS: If you use very long (+2000 token) replies with lots of <tags>, the chance of non-valid json responses is higher. 
+
 ## A note on model choice
 
 This was built and tuned against a 31B creative-writing finetune, and stayed roughly 80–90% accurate across 2000+ message conversations. Smaller or more heavily "creative-over-correct" tuned models will drift more; if you're seeing frequent extraction failures, try enabling grammar mode above, or shortening how many messages get sent per extraction pass in settings.
